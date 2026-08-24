@@ -36,7 +36,7 @@ process, and this one talks to your Nostr signer. Read the source before you
 install it.
 
 ```bash
-omarchy plugin add https://github.com/punkscience/omarchy-scrobble.git --enable
+omarchy plugin add https://github.com/Punk-Science-Studios-Inc/omarchy-scrobble.git --enable
 ```
 
 The plugin ID is `io.github.punkscience.omarchy-scrobble`.
