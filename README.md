@@ -312,4 +312,7 @@ install it.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+**All rights reserved.** No licence is granted — see [LICENSE](LICENSE).
+
+The source is published so you can read it before trusting it with your keys,
+not as a grant to use it. Contact Punk Science Studios Inc. for licensing.

@@ -4,7 +4,7 @@
   "name": "Scrobble",
   "version": "1.2.0",
   "author": "Darryl G. Wright",
-  "license": "MIT",
+  "license": "LicenseRef-Proprietary",
   "description": "Publish the currently playing track to your Nostr status (NIP-38) and to ListenBrainz.",
   "kinds": [
     "service",
