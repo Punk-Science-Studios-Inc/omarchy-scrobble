@@ -312,7 +312,6 @@ install it.
 
 ## License
 
-**All rights reserved.** No licence is granted — see [LICENSE](LICENSE).
-
-The source is published so you can read it before trusting it with your keys,
-not as a grant to use it. Contact Punk Science Studios Inc. for licensing.
+[The Unlicense](https://unlicense.org/) — this is free and unencumbered
+software released into the public domain. Do whatever you like with it.
+See [LICENSE](LICENSE).
