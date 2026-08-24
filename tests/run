@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Runs every suite. Nothing here touches a public relay or a real account.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "== manifest =="
+omarchy plugin validate . && echo "  ok   manifest validates"
+
+echo
+echo "== model (node) =="
+node tests/model.test.mjs
+
+echo
+echo "== helper crypto (python) =="
+python3 tests/helper_test.py
+
+echo
+echo "== relay client (python) =="
+python3 tests/relay_test.py
+
+echo
+echo "== nip-46 remote signing (python) =="
+python3 tests/nip46_test.py
+
+echo
+echo "== listenbrainz (python) =="
+python3 tests/listenbrainz_test.py

@@ -1,0 +1,2156 @@
+#!/usr/bin/env python3
+"""omarchy-scrobble — now-playing publisher for the Omarchy shell plugin.
+
+The QML side of the plugin watches MPRIS and decides *when* something should
+be published. This helper does the parts QML cannot: BIP-340 Schnorr signing,
+speaking WebSocket to Nostr relays, and talking HTTP to ListenBrainz.
+
+Every subcommand prints a single JSON object on stdout and exits 0 unless the
+process itself failed, so the caller can parse one line and never has to read
+stderr. Failures are reported as {"ok": false, "error": "..."}.
+
+Python 3 standard library only, by design: an Omarchy plugin is a git clone,
+not a package, so it cannot pull dependencies at install time.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.2.0"
+USER_AGENT = f"omarchy-scrobble/{VERSION}"
+
+DEFAULT_RELAYS = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+]
+DEFAULT_LISTENBRAINZ_URL = "https://api.listenbrainz.org"
+
+KIND_METADATA = 0
+KIND_USER_STATUS = 30315  # NIP-38
+STATUS_D_TAG = "music"
+
+MAX_AVATAR_BYTES = 4 * 1024 * 1024
+
+
+# --------------------------------------------------------------------- paths
+
+
+def config_home() -> str:
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+
+
+def cache_home() -> str:
+    return os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+
+
+def config_path() -> str:
+    return os.path.join(config_home(), "omarchy-scrobble", "config.json")
+
+
+def cache_dir() -> str:
+    return os.path.join(cache_home(), "omarchy-scrobble")
+
+
+# -------------------------------------------------------------------- bech32
+#
+# BIP-173, used by NIP-19 for the nsec/npub encodings. Reference implementation,
+# trimmed to the two operations this helper needs.
+
+BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def bech32_polymod(values):
+    generator = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ value
+        for i in range(5):
+            chk ^= generator[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def bech32_hrp_expand(hrp):
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def bech32_create_checksum(hrp, data):
+    values = bech32_hrp_expand(hrp) + data
+    polymod = bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def bech32_encode(hrp, data):
+    combined = data + bech32_create_checksum(hrp, data)
+    return hrp + "1" + "".join(BECH32_CHARSET[d] for d in combined)
+
+
+def bech32_decode(bech):
+    if any(ord(c) < 33 or ord(c) > 126 for c in bech):
+        raise ValueError("bech32 string has out-of-range characters")
+    if bech.lower() != bech and bech.upper() != bech:
+        raise ValueError("bech32 string mixes upper and lower case")
+    bech = bech.lower()
+    pos = bech.rfind("1")
+    if pos < 1 or pos + 7 > len(bech):
+        raise ValueError("bech32 string has no usable separator")
+    hrp = bech[:pos]
+    try:
+        data = [BECH32_CHARSET.index(c) for c in bech[pos + 1:]]
+    except ValueError:
+        raise ValueError("bech32 string has an invalid data character") from None
+    if bech32_polymod(bech32_hrp_expand(hrp) + data) != 1:
+        raise ValueError("bech32 checksum mismatch")
+    return hrp, data[:-6]
+
+
+def convertbits(data, frombits, tobits, pad=True):
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    max_acc = (1 << (frombits + tobits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            raise ValueError("value out of range for base conversion")
+        acc = ((acc << frombits) | value) & max_acc
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        raise ValueError("invalid padding in base conversion")
+    return ret
+
+
+def bech32_to_bytes(value, expected_hrp):
+    hrp, data = bech32_decode(value)
+    if hrp != expected_hrp:
+        raise ValueError(f"expected a {expected_hrp}1... value, got {hrp}1...")
+    return bytes(convertbits(data, 5, 8, False))
+
+
+def bytes_to_bech32(raw, hrp):
+    return bech32_encode(hrp, convertbits(list(raw), 8, 5, True))
+
+
+# -------------------------------------------------------- secp256k1 / BIP-340
+#
+# Pure-integer curve arithmetic. Signing happens once per track change, so the
+# few milliseconds this costs are irrelevant, and it keeps the plugin free of
+# native dependencies.
+
+CURVE_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+CURVE_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+CURVE_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+
+
+def point_add(p1, p2):
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    if p1[0] == p2[0] and p1[1] != p2[1]:
+        return None
+    if p1 == p2:
+        lam = (3 * p1[0] * p1[0] * pow(2 * p1[1], CURVE_P - 2, CURVE_P)) % CURVE_P
+    else:
+        lam = ((p2[1] - p1[1]) * pow(p2[0] - p1[0], CURVE_P - 2, CURVE_P)) % CURVE_P
+    x3 = (lam * lam - p1[0] - p2[0]) % CURVE_P
+    return (x3, (lam * (p1[0] - x3) - p1[1]) % CURVE_P)
+
+
+def point_mul(point, scalar):
+    result = None
+    for i in range(256):
+        if (scalar >> i) & 1:
+            result = point_add(result, point)
+        point = point_add(point, point)
+    return result
+
+
+def tagged_hash(tag, msg):
+    tag_hash = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_hash + tag_hash + msg).digest()
+
+
+def has_even_y(point):
+    return point[1] % 2 == 0
+
+
+def lift_x(x):
+    if x >= CURVE_P:
+        return None
+    y_sq = (pow(x, 3, CURVE_P) + 7) % CURVE_P
+    y = pow(y_sq, (CURVE_P + 1) // 4, CURVE_P)
+    if pow(y, 2, CURVE_P) != y_sq:
+        return None
+    return (x, y if y % 2 == 0 else CURVE_P - y)
+
+
+def schnorr_sign(msg: bytes, seckey: bytes, aux_rand: bytes) -> bytes:
+    """BIP-340 sign. `msg` is the 32-byte event id, `seckey` the 32-byte key."""
+    d0 = int.from_bytes(seckey, "big")
+    if not 1 <= d0 <= CURVE_N - 1:
+        raise ValueError("secret key is not in range [1, n-1]")
+    point = point_mul(CURVE_G, d0)
+    d = d0 if has_even_y(point) else CURVE_N - d0
+    t = d ^ int.from_bytes(tagged_hash("BIP0340/aux", aux_rand), "big")
+    rand = tagged_hash(
+        "BIP0340/nonce",
+        t.to_bytes(32, "big") + point[0].to_bytes(32, "big") + msg,
+    )
+    k0 = int.from_bytes(rand, "big") % CURVE_N
+    if k0 == 0:
+        raise ValueError("nonce generation failed")
+    nonce_point = point_mul(CURVE_G, k0)
+    k = k0 if has_even_y(nonce_point) else CURVE_N - k0
+    e = int.from_bytes(
+        tagged_hash(
+            "BIP0340/challenge",
+            nonce_point[0].to_bytes(32, "big")
+            + point[0].to_bytes(32, "big")
+            + msg,
+        ),
+        "big",
+    ) % CURVE_N
+    return nonce_point[0].to_bytes(32, "big") + ((k + e * d) % CURVE_N).to_bytes(32, "big")
+
+
+def schnorr_verify(msg: bytes, pubkey: bytes, sig: bytes) -> bool:
+    """Only used by the test suite, but it lives next to the signer on purpose."""
+    if len(msg) != 32 or len(pubkey) != 32 or len(sig) != 64:
+        return False
+    point = lift_x(int.from_bytes(pubkey, "big"))
+    r = int.from_bytes(sig[:32], "big")
+    s = int.from_bytes(sig[32:], "big")
+    if point is None or r >= CURVE_P or s >= CURVE_N:
+        return False
+    e = int.from_bytes(
+        tagged_hash("BIP0340/challenge", sig[:32] + pubkey + msg), "big"
+    ) % CURVE_N
+    result = point_add(point_mul(CURVE_G, s), point_mul(point, CURVE_N - e))
+    return result is not None and has_even_y(result) and result[0] == r
+
+
+def public_key_from_secret(seckey: bytes) -> bytes:
+    d0 = int.from_bytes(seckey, "big")
+    if not 1 <= d0 <= CURVE_N - 1:
+        raise ValueError("secret key is not in range [1, n-1]")
+    return point_mul(CURVE_G, d0)[0].to_bytes(32, "big")
+
+
+# ------------------------------------------------------------------ chacha20
+#
+# RFC 8439, needed by NIP-44. Roughly a millisecond per kilobyte in pure
+# Python, and NIP-46 messages are a few hundred bytes.
+
+
+def _rotl32(value, count):
+    return ((value << count) & 0xFFFFFFFF) | (value >> (32 - count))
+
+
+def _quarter_round(state, a, b, c, d):
+    state[a] = (state[a] + state[b]) & 0xFFFFFFFF
+    state[d] = _rotl32(state[d] ^ state[a], 16)
+    state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+    state[b] = _rotl32(state[b] ^ state[c], 12)
+    state[a] = (state[a] + state[b]) & 0xFFFFFFFF
+    state[d] = _rotl32(state[d] ^ state[a], 8)
+    state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+    state[b] = _rotl32(state[b] ^ state[c], 7)
+
+
+def _chacha20_block(key: bytes, counter: int, nonce: bytes) -> bytes:
+    state = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+    state += list(struct.unpack("<8I", key))
+    state += [counter & 0xFFFFFFFF]
+    state += list(struct.unpack("<3I", nonce))
+
+    working = list(state)
+    for _ in range(10):  # 20 rounds, two per iteration
+        _quarter_round(working, 0, 4, 8, 12)
+        _quarter_round(working, 1, 5, 9, 13)
+        _quarter_round(working, 2, 6, 10, 14)
+        _quarter_round(working, 3, 7, 11, 15)
+        _quarter_round(working, 0, 5, 10, 15)
+        _quarter_round(working, 1, 6, 11, 12)
+        _quarter_round(working, 2, 7, 8, 13)
+        _quarter_round(working, 3, 4, 9, 14)
+
+    return struct.pack("<16I", *[(working[i] + state[i]) & 0xFFFFFFFF for i in range(16)])
+
+
+def chacha20(key: bytes, nonce: bytes, data: bytes, counter: int = 0) -> bytes:
+    out = bytearray(len(data))
+    for offset in range(0, len(data), 64):
+        stream = _chacha20_block(key, counter + offset // 64, nonce)
+        chunk = data[offset:offset + 64]
+        for i, byte in enumerate(chunk):
+            out[offset + i] = byte ^ stream[i]
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------- hkdf
+
+
+def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    out = b""
+    block = b""
+    counter = 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+
+# -------------------------------------------------------------------- nip-44
+#
+# The encryption NIP-46 uses to talk to a remote signer. Version 2:
+# ChaCha20 for confidentiality, HMAC-SHA256 for integrity, and a padding
+# scheme that hides the exact message length.
+
+
+class Nip44Error(Exception):
+    pass
+
+
+def ecdh_shared_x(seckey: bytes, pubkey_xonly: bytes) -> bytes:
+    """The x coordinate of seckey * P, where P is the even-y lift of the peer."""
+    point = lift_x(int.from_bytes(pubkey_xonly, "big"))
+    if point is None:
+        raise Nip44Error("peer public key is not a valid curve point")
+    scalar = int.from_bytes(seckey, "big")
+    if not 1 <= scalar <= CURVE_N - 1:
+        raise Nip44Error("secret key is not in range [1, n-1]")
+    shared = point_mul(point, scalar)
+    if shared is None:
+        raise Nip44Error("ECDH produced the point at infinity")
+    return shared[0].to_bytes(32, "big")
+
+
+def nip44_conversation_key(seckey: bytes, pubkey_xonly: bytes) -> bytes:
+    return hkdf_extract(b"nip44-v2", ecdh_shared_x(seckey, pubkey_xonly))
+
+
+def nip44_message_keys(conversation_key: bytes, nonce: bytes):
+    if len(conversation_key) != 32:
+        raise Nip44Error("conversation key must be 32 bytes")
+    if len(nonce) != 32:
+        raise Nip44Error("nonce must be 32 bytes")
+    material = hkdf_expand(conversation_key, nonce, 76)
+    return material[0:32], material[32:44], material[44:76]
+
+
+def nip44_padded_len(unpadded: int) -> int:
+    """Message lengths are quantised so a payload's size leaks less about it."""
+    if unpadded <= 0:
+        raise Nip44Error("message is empty")
+    if unpadded <= 32:
+        return 32
+    next_power = 1 << (unpadded - 1).bit_length()
+    chunk = 32 if next_power <= 256 else next_power // 8
+    return chunk * (((unpadded - 1) // chunk) + 1)
+
+
+def nip44_encrypt(plaintext: str, conversation_key: bytes, nonce: bytes = None) -> str:
+    raw = plaintext.encode("utf-8")
+    if not 1 <= len(raw) <= 65535:
+        raise Nip44Error(f"message length {len(raw)} is out of range")
+    if nonce is None:
+        nonce = os.urandom(32)
+
+    chacha_key, chacha_nonce, hmac_key = nip44_message_keys(conversation_key, nonce)
+    padded = (
+        len(raw).to_bytes(2, "big")
+        + raw
+        + bytes(nip44_padded_len(len(raw)) - len(raw))
+    )
+    ciphertext = chacha20(chacha_key, chacha_nonce, padded)
+    mac = hmac.new(hmac_key, nonce + ciphertext, hashlib.sha256).digest()
+    return base64.b64encode(b"\x02" + nonce + ciphertext + mac).decode()
+
+
+def nip44_decrypt(payload: str, conversation_key: bytes) -> str:
+    if payload.startswith("#"):
+        raise Nip44Error("unsupported encryption version")
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except Exception:
+        raise Nip44Error("payload is not valid base64") from None
+    if len(raw) < 99 or len(raw) > 65603:
+        raise Nip44Error(f"payload length {len(raw)} is out of range")
+    if raw[0] != 2:
+        raise Nip44Error(f"unsupported encryption version {raw[0]}")
+
+    nonce, ciphertext, mac = raw[1:33], raw[33:-32], raw[-32:]
+    chacha_key, chacha_nonce, hmac_key = nip44_message_keys(conversation_key, nonce)
+    expected = hmac.new(hmac_key, nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        raise Nip44Error("message authentication failed")
+
+    padded = chacha20(chacha_key, chacha_nonce, ciphertext)
+    length = int.from_bytes(padded[:2], "big")
+    plaintext = padded[2:2 + length]
+    if length == 0 or len(plaintext) != length or len(padded) != 2 + nip44_padded_len(length):
+        raise Nip44Error("invalid padding")
+    return plaintext.decode("utf-8")
+
+
+# ----------------------------------------------------------------------- aes
+#
+# AES-256-CBC, needed only by NIP-04 — the legacy encryption some signers
+# still use for NIP-46. The tables are derived at import rather than pasted
+# in, which removes any chance of a transcription error and costs microseconds.
+
+
+def _build_aes_tables():
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        # p walks the generator 3, q walks its inverse.
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        value = q ^ ((q << 1) | (q >> 7)) ^ ((q << 2) | (q >> 6))
+        value ^= ((q << 3) | (q >> 5)) ^ ((q << 4) | (q >> 4))
+        sbox[p] = (value ^ 0x63) & 0xFF
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    inverse = [0] * 256
+    for i, value in enumerate(sbox):
+        inverse[value] = i
+    return sbox, inverse
+
+
+AES_SBOX, AES_INV_SBOX = _build_aes_tables()
+AES_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36, 0x6C, 0xD8, 0xAB, 0x4D]
+
+
+def _xtime(a):
+    a <<= 1
+    return (a ^ 0x1B) & 0xFF if a & 0x100 else a
+
+
+def _gmul(a, b):
+    result = 0
+    for _ in range(8):
+        if b & 1:
+            result ^= a
+        b >>= 1
+        a = _xtime(a)
+    return result
+
+
+def _aes_expand_key(key: bytes):
+    nk = len(key) // 4
+    rounds = nk + 6
+    words = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (rounds + 1)):
+        temp = list(words[i - 1])
+        if i % nk == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [AES_SBOX[b] for b in temp]
+            temp[0] ^= AES_RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            temp = [AES_SBOX[b] for b in temp]
+        words.append([words[i - nk][j] ^ temp[j] for j in range(4)])
+    return words, rounds
+
+
+def _add_round_key(state, words, rnd):
+    for column in range(4):
+        word = words[rnd * 4 + column]
+        for row in range(4):
+            state[row][column] ^= word[row]
+
+
+def _aes_encrypt_block(block: bytes, words, rounds) -> bytes:
+    state = [[block[row + 4 * col] for col in range(4)] for row in range(4)]
+    _add_round_key(state, words, 0)
+
+    for rnd in range(1, rounds + 1):
+        for row in range(4):
+            for col in range(4):
+                state[row][col] = AES_SBOX[state[row][col]]
+        for row in range(1, 4):
+            state[row] = state[row][row:] + state[row][:row]
+        if rnd != rounds:
+            for col in range(4):
+                column = [state[row][col] for row in range(4)]
+                state[0][col] = _gmul(column[0], 2) ^ _gmul(column[1], 3) ^ column[2] ^ column[3]
+                state[1][col] = column[0] ^ _gmul(column[1], 2) ^ _gmul(column[2], 3) ^ column[3]
+                state[2][col] = column[0] ^ column[1] ^ _gmul(column[2], 2) ^ _gmul(column[3], 3)
+                state[3][col] = _gmul(column[0], 3) ^ column[1] ^ column[2] ^ _gmul(column[3], 2)
+        _add_round_key(state, words, rnd)
+
+    return bytes(state[row][col] for col in range(4) for row in range(4))
+
+
+def _aes_decrypt_block(block: bytes, words, rounds) -> bytes:
+    state = [[block[row + 4 * col] for col in range(4)] for row in range(4)]
+    _add_round_key(state, words, rounds)
+
+    for rnd in range(rounds - 1, -1, -1):
+        for row in range(1, 4):
+            state[row] = state[row][-row:] + state[row][:-row]
+        for row in range(4):
+            for col in range(4):
+                state[row][col] = AES_INV_SBOX[state[row][col]]
+        _add_round_key(state, words, rnd)
+        if rnd != 0:
+            for col in range(4):
+                column = [state[row][col] for row in range(4)]
+                state[0][col] = _gmul(column[0], 14) ^ _gmul(column[1], 11) ^ _gmul(column[2], 13) ^ _gmul(column[3], 9)
+                state[1][col] = _gmul(column[0], 9) ^ _gmul(column[1], 14) ^ _gmul(column[2], 11) ^ _gmul(column[3], 13)
+                state[2][col] = _gmul(column[0], 13) ^ _gmul(column[1], 9) ^ _gmul(column[2], 14) ^ _gmul(column[3], 11)
+                state[3][col] = _gmul(column[0], 11) ^ _gmul(column[1], 13) ^ _gmul(column[2], 9) ^ _gmul(column[3], 14)
+
+    return bytes(state[row][col] for col in range(4) for row in range(4))
+
+
+def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    words, rounds = _aes_expand_key(key)
+    pad = 16 - (len(plaintext) % 16)
+    padded = plaintext + bytes([pad]) * pad
+    out = bytearray()
+    previous = iv
+    for offset in range(0, len(padded), 16):
+        block = bytes(a ^ b for a, b in zip(padded[offset:offset + 16], previous))
+        previous = _aes_encrypt_block(block, words, rounds)
+        out += previous
+    return bytes(out)
+
+
+def aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    if not ciphertext or len(ciphertext) % 16:
+        raise ValueError("ciphertext is not a whole number of AES blocks")
+    words, rounds = _aes_expand_key(key)
+    out = bytearray()
+    previous = iv
+    for offset in range(0, len(ciphertext), 16):
+        block = ciphertext[offset:offset + 16]
+        out += bytes(a ^ b for a, b in zip(_aes_decrypt_block(block, words, rounds), previous))
+        previous = block
+    pad = out[-1]
+    if not 1 <= pad <= 16 or bytes(out[-pad:]) != bytes([pad]) * pad:
+        raise ValueError("invalid PKCS#7 padding")
+    return bytes(out[:-pad])
+
+
+# -------------------------------------------------------------------- nip-04
+#
+# The older NIP-46 transport encryption. Kept because signers in the wild
+# still speak it, and a login that silently fails is worse than the code.
+
+
+def nip04_shared_secret(seckey: bytes, pubkey_xonly: bytes) -> bytes:
+    return ecdh_shared_x(seckey, pubkey_xonly)
+
+
+def nip04_encrypt(plaintext: str, seckey: bytes, pubkey_xonly: bytes) -> str:
+    iv = os.urandom(16)
+    ciphertext = aes_cbc_encrypt(
+        nip04_shared_secret(seckey, pubkey_xonly), iv, plaintext.encode("utf-8")
+    )
+    return (
+        base64.b64encode(ciphertext).decode()
+        + "?iv="
+        + base64.b64encode(iv).decode()
+    )
+
+
+def nip04_decrypt(payload: str, seckey: bytes, pubkey_xonly: bytes) -> str:
+    if "?iv=" not in payload:
+        raise ValueError("not a NIP-04 payload")
+    body, _, iv_part = payload.partition("?iv=")
+    plaintext = aes_cbc_decrypt(
+        nip04_shared_secret(seckey, pubkey_xonly),
+        base64.b64decode(iv_part),
+        base64.b64decode(body),
+    )
+    return plaintext.decode("utf-8")
+
+
+def is_nip04_payload(payload: str) -> bool:
+    return "?iv=" in payload
+
+
+# ----------------------------------------------------------------- websocket
+#
+# Relays speak WebSocket and nothing else, and the standard library has no
+# client. This is the RFC 6455 subset that matters: a client handshake, masked
+# text frames out, defragmented text frames in, and automatic pong replies.
+
+
+class WebSocketError(Exception):
+    pass
+
+
+class WebSocket:
+    def __init__(self, url: str, timeout: float = 8.0):
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("ws", "wss"):
+            raise WebSocketError(f"not a websocket url: {url}")
+        secure = parts.scheme == "wss"
+        host = parts.hostname
+        if not host:
+            raise WebSocketError(f"url has no host: {url}")
+        port = parts.port or (443 if secure else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+
+        self._buffer = b""
+        self._deadline = time.monotonic() + timeout
+        self._sock = socket.create_connection((host, port), timeout=timeout)
+        if secure:
+            context = ssl.create_default_context()
+            self._sock = context.wrap_socket(self._sock, server_hostname=host)
+
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            f"User-Agent: {USER_AGENT}\r\n"
+            "\r\n"
+        )
+        self._sock.sendall(request.encode())
+
+        header_blob = self._read_until(b"\r\n\r\n")
+        head = header_blob.decode("latin-1")
+        status_line = head.split("\r\n", 1)[0]
+        if "101" not in status_line:
+            raise WebSocketError(f"handshake refused: {status_line.strip()}")
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        ).decode()
+        if expected.lower() not in head.lower():
+            raise WebSocketError("handshake accept key mismatch")
+
+    # -- plumbing
+
+    def _remaining(self) -> float:
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise WebSocketError("timed out")
+        return left
+
+    def _fill(self):
+        self._sock.settimeout(self._remaining())
+        try:
+            chunk = self._sock.recv(65536)
+        except socket.timeout:
+            raise WebSocketError("timed out") from None
+        if not chunk:
+            raise WebSocketError("connection closed by relay")
+        self._buffer += chunk
+
+    def _read_exactly(self, count: int) -> bytes:
+        while len(self._buffer) < count:
+            self._fill()
+        head, self._buffer = self._buffer[:count], self._buffer[count:]
+        return head
+
+    def _read_until(self, marker: bytes) -> bytes:
+        while marker not in self._buffer:
+            self._fill()
+        index = self._buffer.index(marker) + len(marker)
+        head, self._buffer = self._buffer[:index], self._buffer[index:]
+        return head
+
+    def _send_frame(self, opcode: int, payload: bytes):
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack("!H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack("!Q", length)
+        mask = os.urandom(4)
+        header += mask
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        self._sock.settimeout(self._remaining())
+        self._sock.sendall(bytes(header) + masked)
+
+    def _read_frame(self):
+        first, second = self._read_exactly(2)
+        fin = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._read_exactly(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._read_exactly(8))[0]
+        mask = self._read_exactly(4) if masked else None
+        payload = self._read_exactly(length) if length else b""
+        if mask:
+            payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        return fin, opcode, payload
+
+    # -- public surface
+
+    def extend_deadline(self, seconds: float):
+        self._deadline = time.monotonic() + seconds
+
+    def send_json(self, value):
+        self._send_frame(0x1, json.dumps(value, separators=(",", ":")).encode())
+
+    def recv_json(self):
+        """Next application message, decoded. Control frames handled inline."""
+        pending = b""
+        pending_is_text = False
+        while True:
+            fin, opcode, payload = self._read_frame()
+            if opcode == 0x8:
+                raise WebSocketError("relay closed the connection")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode == 0x0:
+                pending += payload
+            elif opcode in (0x1, 0x2):
+                pending = payload
+                pending_is_text = opcode == 0x1
+            else:
+                raise WebSocketError(f"unexpected websocket opcode {opcode}")
+            if not fin:
+                continue
+            if not pending_is_text:
+                pending = b""
+                continue
+            text = pending.decode("utf-8", "replace")
+            pending = b""
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+    def close(self):
+        try:
+            self._send_frame(0x8, b"\x03\xe8")
+        except Exception:
+            pass
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+# -------------------------------------------------------------- nostr events
+
+
+def serialize_event(pubkey_hex, created_at, kind, tags, content) -> bytes:
+    return json.dumps(
+        [0, pubkey_hex, created_at, kind, tags, content],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def build_event(seckey: bytes, kind: int, tags, content: str, created_at=None) -> dict:
+    pubkey_hex = public_key_from_secret(seckey).hex()
+    created_at = int(created_at if created_at is not None else time.time())
+    event_id = hashlib.sha256(
+        serialize_event(pubkey_hex, created_at, kind, tags, content)
+    ).digest()
+    signature = schnorr_sign(event_id, seckey, os.urandom(32))
+    return {
+        "id": event_id.hex(),
+        "pubkey": pubkey_hex,
+        "created_at": created_at,
+        "kind": kind,
+        "tags": tags,
+        "content": content,
+        "sig": signature.hex(),
+    }
+
+
+def publish_to_relay(url: str, event: dict, timeout: float) -> dict:
+    try:
+        with WebSocket(url, timeout) as ws:
+            ws.send_json(["EVENT", event])
+            while True:
+                message = ws.recv_json()
+                if not isinstance(message, list) or not message:
+                    continue
+                if message[0] == "OK" and len(message) >= 3 and message[1] == event["id"]:
+                    detail = message[3] if len(message) > 3 else ""
+                    return {"relay": url, "ok": bool(message[2]), "detail": str(detail)}
+                if message[0] == "NOTICE":
+                    continue
+    except (WebSocketError, OSError, ssl.SSLError) as error:
+        return {"relay": url, "ok": False, "detail": str(error) or error.__class__.__name__}
+
+
+def publish(relays, event: dict, timeout: float = 8.0) -> dict:
+    results = [None] * len(relays)
+
+    def worker(index, url):
+        results[index] = publish_to_relay(url, event, timeout)
+
+    threads = [
+        threading.Thread(target=worker, args=(i, url), daemon=True)
+        for i, url in enumerate(relays)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout + 2.0)
+
+    settled = [
+        result or {"relay": relays[i], "ok": False, "detail": "timed out"}
+        for i, result in enumerate(results)
+    ]
+    accepted = [r["relay"] for r in settled if r["ok"]]
+    return {
+        "ok": bool(accepted),
+        "eventId": event["id"],
+        "accepted": accepted,
+        "relays": settled,
+    }
+
+
+def query_relay(url: str, filters: dict, timeout: float) -> list:
+    """Collect events for one filter until EOSE or the deadline."""
+    events = []
+    subscription = base64.b32encode(os.urandom(8)).decode().strip("=").lower()
+    try:
+        with WebSocket(url, timeout) as ws:
+            ws.send_json(["REQ", subscription, filters])
+            while True:
+                message = ws.recv_json()
+                if not isinstance(message, list) or len(message) < 2:
+                    continue
+                if message[0] == "EVENT" and message[1] == subscription and len(message) >= 3:
+                    events.append(message[2])
+                elif message[0] in ("EOSE", "CLOSED") and message[1] == subscription:
+                    break
+    except (WebSocketError, OSError, ssl.SSLError):
+        pass
+    return events
+
+
+def query(relays, filters: dict, timeout: float = 8.0) -> list:
+    collected = [[] for _ in relays]
+
+    def worker(index, url):
+        collected[index] = query_relay(url, filters, timeout)
+
+    threads = [
+        threading.Thread(target=worker, args=(i, url), daemon=True)
+        for i, url in enumerate(relays)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout + 2.0)
+
+    return [event for bucket in collected for event in bucket]
+
+
+# -------------------------------------------------------------------- config
+
+
+class ConfigError(Exception):
+    pass
+
+
+def read_config(path: str) -> dict:
+    # A paired phone signer needs no config file at all, so a missing one is
+    # not an error here; the commands that need a local key say so themselves.
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"{path} is not valid JSON: {error}") from None
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} must contain a JSON object")
+
+    mode = os.stat(path).st_mode & 0o077
+    if mode and data.get("nsec"):
+        raise ConfigError(
+            f"{path} holds a secret key but is readable by others — run: chmod 600 {path}"
+        )
+    return data
+
+
+def relays_from(config: dict) -> list:
+    relays = config.get("relays")
+    if not isinstance(relays, list):
+        return list(DEFAULT_RELAYS)
+    cleaned = [
+        r.strip()
+        for r in relays
+        if isinstance(r, str) and r.strip().startswith(("ws://", "wss://"))
+    ]
+    return cleaned or list(DEFAULT_RELAYS)
+
+
+def secret_key_from(config: dict) -> bytes:
+    """Resolve the signing key from `nsec`, or from `nsecCommand` for people
+    who keep it in a password manager rather than on disk."""
+    nsec = config.get("nsec")
+    if not nsec and config.get("nsecCommand"):
+        import subprocess
+
+        try:
+            completed = subprocess.run(
+                config["nsecCommand"],
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+        except subprocess.SubprocessError as error:
+            raise ConfigError(f"nsecCommand failed: {error}") from None
+        nsec = completed.stdout.strip()
+    if not nsec:
+        raise ConfigError(
+            "not signed in — pair a phone signer with `login`, "
+            "or set `nsec` in the config file"
+        )
+
+    nsec = nsec.strip()
+    try:
+        if nsec.startswith("nsec1"):
+            key = bech32_to_bytes(nsec, "nsec")
+        else:
+            key = bytes.fromhex(nsec)
+    except ValueError as error:
+        raise ConfigError(f"could not decode the signing key: {error}") from None
+    if len(key) != 32:
+        raise ConfigError(f"signing key must be 32 bytes, got {len(key)}")
+    return key
+
+
+# ------------------------------------------------------------- listenbrainz
+
+
+def listenbrainz_submit(config: dict, payload: dict, timeout: float = 8.0) -> dict:
+    token = config.get("listenbrainzToken")
+    if not token:
+        return {"ok": False, "skipped": True, "detail": "no listenbrainzToken configured"}
+
+    base = str(config.get("listenbrainzUrl") or DEFAULT_LISTENBRAINZ_URL).rstrip("/")
+    request = urllib.request.Request(
+        f"{base}/1/submit-listens",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Token {token}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+            return {"ok": True, "status": response.status}
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:300]
+        return {"ok": False, "status": error.code, "detail": detail}
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        return {"ok": False, "detail": str(error)}
+
+
+def listenbrainz_send(config, artist, title, album, duration_ms, now_playing,
+                      listened_at=None, timeout=10.0) -> dict:
+    """Submit a now-playing or a listen by whichever route is signed in."""
+    mode = listenbrainz_mode(config)
+    if mode == "none":
+        return {"ok": False, "skipped": True, "detail": "ListenBrainz is not connected"}
+
+    if mode == "session":
+        entry = {
+            "artist": artist,
+            "title": title,
+            "album": album,
+            "duration": duration_ms // 1000 if duration_ms > 0 else 0,
+            "listened_at": int(listened_at if listened_at is not None else time.time()),
+        }
+        return listenbrainz_submit_compat(
+            load_listenbrainz_session(), config, [entry], now_playing, timeout=timeout
+        )
+
+    metadata = track_metadata(artist, title, album, duration_ms)
+    if now_playing:
+        payload = {"listen_type": "playing_now", "payload": [metadata]}
+    else:
+        metadata["listened_at"] = int(listened_at if listened_at is not None else time.time())
+        payload = {"listen_type": "single", "payload": [metadata]}
+    result = listenbrainz_submit(config, payload, timeout=timeout)
+    result["via"] = "token"
+    return result
+
+
+def track_metadata(artist: str, title: str, album: str, duration_ms: int) -> dict:
+    additional = {
+        "media_player": "omarchy-scrobble",
+        "submission_client": "omarchy-scrobble",
+        "submission_client_version": VERSION,
+    }
+    if duration_ms > 0:
+        additional["duration_ms"] = duration_ms
+    metadata = {
+        "artist_name": artist,
+        "track_name": title,
+        "additional_info": additional,
+    }
+    if album:
+        metadata["release_name"] = album
+    return {"track_metadata": metadata}
+
+
+# ------------------------------------------------- listenbrainz: signing in
+#
+# ListenBrainz is not an OAuth2 provider — its native API authenticates with a
+# user token you copy off the settings page by hand. What it does offer is a
+# Last.fm-compatible API, and that protocol has a proper desktop sign-in: ask
+# for a token, send the user to a web page to approve it (which is a MusicBrainz
+# login), then trade the approved token for a session key.
+#
+# That is the flow used here, so signing in is a click rather than a copy-paste.
+# Listens submitted this way land in exactly the same place.
+
+LISTENBRAINZ_COMPAT_URL = "https://listenbrainz.org/2.0/"
+LISTENBRAINZ_AUTH_URL = "https://listenbrainz.org/api/auth/"
+
+
+class ListenBrainzError(Exception):
+    pass
+
+
+def listenbrainz_session_path() -> str:
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(data_home, "omarchy-scrobble", "listenbrainz.json")
+
+
+def load_listenbrainz_session():
+    try:
+        with open(listenbrainz_session_path(), "r", encoding="utf-8") as handle:
+            session = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return session if isinstance(session, dict) and session.get("sessionKey") else None
+
+
+def save_listenbrainz_session(session: dict):
+    path = listenbrainz_session_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".part"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(session, handle, indent=2)
+    os.replace(temporary, path)
+
+
+def delete_listenbrainz_session():
+    try:
+        os.remove(listenbrainz_session_path())
+        return True
+    except OSError:
+        return False
+
+
+def listenbrainz_mode(config: dict) -> str:
+    """A pasted user token wins: someone who set one meant to use it."""
+    if config.get("listenbrainzToken"):
+        return "token"
+    return "session" if load_listenbrainz_session() else "none"
+
+
+def compat_url(config: dict) -> str:
+    return str(config.get("listenbrainzCompatUrl") or LISTENBRAINZ_COMPAT_URL)
+
+
+def compat_call(url: str, params: dict, method: str = "GET", timeout: float = 15.0):
+    """One Last.fm-compat API call, returning parsed JSON.
+
+    `api_sig` is not sent: ListenBrainz cannot verify it (there is no
+    registered app to hold a shared secret) and its own code strips the field
+    before reading the parameters.
+    """
+    encoded = urllib.parse.urlencode(params)
+    if method == "POST":
+        request = urllib.request.Request(
+            url,
+            data=encoded.encode(),
+            method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": USER_AGENT,
+            },
+        )
+    else:
+        request = urllib.request.Request(
+            f"{url}?{encoded}", headers={"User-Agent": USER_AGENT}
+        )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            raise ListenBrainzError(f"HTTP {error.code}: {body[:200]}") from None
+        raise ListenBrainzError(
+            str(parsed.get("message") or parsed.get("error") or f"HTTP {error.code}")
+        ) from None
+    except (urllib.error.URLError, OSError) as error:
+        raise ListenBrainzError(str(error)) from None
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        raise ListenBrainzError(f"unexpected response: {body[:200]}") from None
+
+
+def listenbrainz_request_token(config: dict, api_key: str, timeout: float) -> str:
+    result = compat_call(
+        compat_url(config),
+        {"method": "auth.gettoken", "api_key": api_key, "format": "json"},
+        timeout=timeout,
+    )
+    token = result.get("token")
+    if not token:
+        raise ListenBrainzError(f"no token in response: {str(result)[:200]}")
+    return str(token)
+
+
+def listenbrainz_fetch_session(config: dict, api_key: str, token: str, timeout: float):
+    """None while the user has not approved yet; the session once they have."""
+    try:
+        result = compat_call(
+            compat_url(config),
+            {
+                "method": "auth.getsession",
+                "api_key": api_key,
+                "token": token,
+                "format": "json",
+            },
+            timeout=timeout,
+        )
+    except ListenBrainzError as error:
+        message = str(error).lower()
+        # "unauthorized token" simply means they have not clicked approve yet.
+        if "unauthorized" in message or "not been authorized" in message:
+            return None
+        if "expired" in message:
+            raise
+        return None
+
+    session = result.get("session") or {}
+    key = session.get("key")
+    if not key:
+        return None
+    return {"sessionKey": str(key), "username": str(session.get("name") or ""), "apiKey": api_key}
+
+
+def open_in_browser(url: str) -> bool:
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            ["xdg-open", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def listenbrainz_submit_compat(session: dict, config: dict, entries: list, now_playing: bool,
+                               timeout: float = 10.0) -> dict:
+    """Submit through the Last.fm-compatible endpoint using a session key."""
+    # Exact casing matters: the server compares the raw method string when it
+    # decides between a now-playing and a real listen.
+    method = "track.updateNowPlaying" if now_playing else "track.scrobble"
+    params = {
+        "method": method,
+        "api_key": session.get("apiKey") or "omarchy-scrobble",
+        "sk": session["sessionKey"],
+        "format": "json",
+    }
+    for index, entry in enumerate(entries):
+        params[f"artist[{index}]"] = entry["artist"]
+        params[f"track[{index}]"] = entry["title"]
+        if entry.get("album"):
+            params[f"album[{index}]"] = entry["album"]
+        if entry.get("duration"):
+            params[f"duration[{index}]"] = str(int(entry["duration"]))
+        if not now_playing:
+            params[f"timestamp[{index}]"] = str(int(entry["listened_at"]))
+
+    try:
+        compat_call(compat_url(config), params, method="POST", timeout=timeout)
+    except ListenBrainzError as error:
+        return {"ok": False, "detail": str(error), "via": "session"}
+    return {"ok": True, "via": "session"}
+
+
+# ------------------------------------------------------------------ profile
+
+
+def download_avatar(url: str) -> str:
+    """Cache the profile picture locally so QML can point an Image at a file."""
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("avatar url must be http(s)")
+
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+        blob = response.read(MAX_AVATAR_BYTES + 1)
+    if len(blob) > MAX_AVATAR_BYTES:
+        raise ValueError("avatar is larger than 4 MiB")
+
+    extension = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/svg+xml": ".svg",
+    }.get(content_type, os.path.splitext(urllib.parse.urlsplit(url).path)[1] or ".img")
+
+    os.makedirs(cache_dir(), exist_ok=True)
+    digest = hashlib.sha256(url.encode()).hexdigest()[:16]
+    path = os.path.join(cache_dir(), f"avatar-{digest}{extension}")
+    temporary = path + ".part"
+    with open(temporary, "wb") as handle:
+        handle.write(blob)
+    os.replace(temporary, path)
+    return path
+
+
+def newest_metadata_event(events: list):
+    newest = None
+    for event in events:
+        if not isinstance(event, dict) or event.get("kind") != KIND_METADATA:
+            continue
+        if newest is None or event.get("created_at", 0) > newest.get("created_at", 0):
+            newest = event
+    return newest
+
+
+def load_cached_profile() -> dict:
+    path = os.path.join(cache_dir(), "profile.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def store_cached_profile(profile: dict):
+    os.makedirs(cache_dir(), exist_ok=True)
+    path = os.path.join(cache_dir(), "profile.json")
+    temporary = path + ".part"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(profile, handle)
+    os.replace(temporary, path)
+
+
+# -------------------------------------------------------------------- nip-46
+#
+# Remote signing. The user's key lives in a signer app on their phone; this
+# process holds only a throwaway "client" keypair used to talk to it. Every
+# event is sent to the signer as an encrypted kind-24133 request over a relay,
+# and comes back signed.
+#
+# Nothing here can produce a signature on its own, which is the entire point:
+# losing this machine does not lose the identity.
+
+KIND_NIP46 = 24133
+CONNECT_TIMEOUT = 300.0  # how long we wait for a phone to scan the QR
+SIGN_TIMEOUT = 60.0      # signing may need a tap to approve
+
+
+class SignerError(Exception):
+    pass
+
+
+def session_path() -> str:
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(data_home, "omarchy-scrobble", "session.json")
+
+
+def load_session():
+    try:
+        with open(session_path(), "r", encoding="utf-8") as handle:
+            session = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(session, dict) or not session.get("clientSecret"):
+        return None
+    return session
+
+
+def save_session(session: dict):
+    path = session_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".part"
+    # Written 0600 before any content lands in it: the client key is not the
+    # user's key, but it is still an authenticated channel to their signer.
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(session, handle, indent=2)
+    os.replace(temporary, path)
+
+
+def delete_session():
+    try:
+        os.remove(session_path())
+        return True
+    except OSError:
+        return False
+
+
+def _decrypt_from_signer(content: str, client_secret: bytes, signer_pubkey: bytes):
+    """Signers use either NIP-44 or the older NIP-04. Detect, don't assume."""
+    if is_nip04_payload(content):
+        return nip04_decrypt(content, client_secret, signer_pubkey), "nip04"
+    conversation_key = nip44_conversation_key(client_secret, signer_pubkey)
+    return nip44_decrypt(content, conversation_key), "nip44"
+
+
+def _encrypt_to_signer(message: str, client_secret: bytes, signer_pubkey: bytes, scheme: str):
+    if scheme == "nip04":
+        return nip04_encrypt(message, client_secret, signer_pubkey)
+    return nip44_encrypt(message, nip44_conversation_key(client_secret, signer_pubkey))
+
+
+def _request_event(client_secret: bytes, signer_pubkey: bytes, payload: dict, scheme: str) -> dict:
+    content = _encrypt_to_signer(
+        json.dumps(payload, separators=(",", ":")), client_secret, signer_pubkey, scheme
+    )
+    return build_event(
+        client_secret, KIND_NIP46, [["p", signer_pubkey.hex()]], content
+    )
+
+
+class RemoteSigner:
+    """A NIP-46 signer reached over a relay.
+
+    One WebSocket is opened per operation rather than held open: the plugin
+    signs a handful of events an hour, and a long-lived socket in a one-shot
+    CLI buys nothing but reconnection logic.
+    """
+
+    def __init__(self, session: dict):
+        self.client_secret = bytes.fromhex(session["clientSecret"])
+        self.client_pubkey = public_key_from_secret(self.client_secret)
+        self.signer_pubkey = bytes.fromhex(session["signerPubkey"])
+        self.user_pubkey_hex = str(session.get("userPubkey") or "")
+        self.relays = [r for r in session.get("relays", []) if isinstance(r, str)] or list(DEFAULT_RELAYS)
+        self.scheme = session.get("encryption") or "nip44"
+        self.auth_url = ""
+
+    def pubkey(self) -> bytes:
+        if not self.user_pubkey_hex:
+            raise SignerError("session has no user public key; sign in again")
+        return bytes.fromhex(self.user_pubkey_hex)
+
+    def request(self, method: str, params: list, timeout: float = SIGN_TIMEOUT):
+        """Send one request to the signer and wait for its matching reply."""
+        request_id = os.urandom(8).hex()
+        payload = {"id": request_id, "method": method, "params": params}
+        last_error = "no relay accepted the request"
+
+        for relay in self.relays:
+            try:
+                return self._request_on(relay, request_id, payload, timeout)
+            except (WebSocketError, OSError, ssl.SSLError, Nip44Error, ValueError) as error:
+                last_error = f"{relay}: {error}"
+        raise SignerError(last_error)
+
+    def _request_on(self, relay: str, request_id: str, payload: dict, timeout: float):
+        with WebSocket(relay, timeout) as ws:
+            subscription = os.urandom(8).hex()
+            # Subscribe before publishing: a fast signer can answer before a
+            # later REQ would have been registered.
+            ws.send_json(["REQ", subscription, {
+                "kinds": [KIND_NIP46],
+                "#p": [self.client_pubkey.hex()],
+                "authors": [self.signer_pubkey.hex()],
+                "limit": 0,
+            }])
+            event = _request_event(self.client_secret, self.signer_pubkey, payload, self.scheme)
+            ws.send_json(["EVENT", event])
+
+            ws.extend_deadline(timeout)
+            while True:
+                message = ws.recv_json()
+                if not isinstance(message, list) or len(message) < 3:
+                    continue
+                if message[0] != "EVENT" or message[1] != subscription:
+                    continue
+                response = self._read_response(message[2], request_id)
+                if response is not None:
+                    return response
+
+    def _read_response(self, event: dict, request_id: str):
+        try:
+            plaintext, scheme = _decrypt_from_signer(
+                event.get("content") or "", self.client_secret, self.signer_pubkey
+            )
+        except (Nip44Error, ValueError):
+            return None
+        try:
+            body = json.loads(plaintext)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(body, dict) or body.get("id") != request_id:
+            return None
+
+        self.scheme = scheme
+        result = body.get("result")
+        # Some signers answer with an "auth_url" first, asking the user to
+        # approve in a browser, then send the real result on the same id.
+        if result == "auth_url":
+            self.auth_url = str(body.get("error") or "")
+            return None
+        if body.get("error"):
+            raise SignerError(str(body["error"]))
+        return result
+
+    def sign(self, kind: int, tags: list, content: str, created_at=None) -> dict:
+        unsigned = {
+            "kind": kind,
+            "content": content,
+            "tags": tags,
+            "created_at": int(created_at if created_at is not None else time.time()),
+            "pubkey": self.user_pubkey_hex,
+        }
+        result = self.request("sign_event", [json.dumps(unsigned, separators=(",", ":"))])
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError:
+                raise SignerError("signer returned a malformed event") from None
+        if not isinstance(result, dict) or not result.get("sig"):
+            raise SignerError("signer did not return a signed event")
+        return result
+
+
+class LocalSigner:
+    """Signs with a key on this machine. Simpler, and strictly less safe."""
+
+    def __init__(self, seckey: bytes):
+        self.seckey = seckey
+
+    def pubkey(self) -> bytes:
+        return public_key_from_secret(self.seckey)
+
+    def sign(self, kind: int, tags: list, content: str, created_at=None) -> dict:
+        return build_event(self.seckey, kind, tags, content, created_at)
+
+
+def get_signer(config: dict):
+    """A saved remote session wins over a local key: if someone has paired a
+    phone, that is the identity they meant to use."""
+    session = load_session()
+    if session:
+        return RemoteSigner(session)
+    return LocalSigner(secret_key_from(config))
+
+
+def signing_mode(config: dict) -> str:
+    if load_session():
+        return "remote"
+    try:
+        secret_key_from(config)
+        return "local"
+    except ConfigError:
+        return "none"
+
+
+# ------------------------------------------------------------------- pairing
+
+
+def connect_relays_from(config: dict) -> list:
+    """Relays used for the signer handshake. Your phone has to reach these
+    too, so they are configurable separately from the publish relays."""
+    relays = config.get("connectRelays")
+    if isinstance(relays, list):
+        cleaned = [
+            r.strip() for r in relays
+            if isinstance(r, str) and r.strip().startswith(("ws://", "wss://"))
+        ]
+        if cleaned:
+            return cleaned
+    return relays_from(config)
+
+
+def qr_matrix(data: str):
+    """A QR code as rows of '0'/'1'.
+
+    The shell renders this as native rectangles — the same thing Omarchy's
+    own Wi-Fi share card does — so there is no image file, no viewer, and it
+    stays legible in any theme.
+    """
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            ["qrencode", "--type", "ASCII", "--margin", "4", "--output", "-"],
+            input=data.encode(),
+            capture_output=True,
+            timeout=15,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    rows = []
+    for line in completed.stdout.decode("utf-8", "replace").splitlines():
+        if not line:
+            continue
+        # qrencode's ASCII output is two characters per module.
+        rows.append("".join("1" if "#" in line[i:i + 2] else "0" for i in range(0, len(line), 2)))
+    size = len(rows)
+    return rows if size and all(len(row) == size for row in rows) else []
+
+
+def build_nostrconnect_uri(client_pubkey: bytes, relays: list, secret: str, name: str) -> str:
+    query = [("relay", relay) for relay in relays]
+    query.append(("secret", secret))
+    # Ask only for what the plugin actually does, so the approval prompt on
+    # the phone is honest about the scope.
+    query.append(("perms", f"get_public_key,sign_event:{KIND_USER_STATUS}"))
+    query.append(("name", name))
+    return f"nostrconnect://{client_pubkey.hex()}?" + urllib.parse.urlencode(query)
+
+
+def parse_bunker_uri(uri: str):
+    parts = urllib.parse.urlsplit(uri.strip())
+    if parts.scheme != "bunker":
+        raise SignerError("expected a bunker:// URI")
+    signer_hex = (parts.netloc or parts.path.lstrip("/")).strip()
+    try:
+        signer = bytes.fromhex(signer_hex)
+    except ValueError:
+        raise SignerError("bunker URI has an invalid signer public key") from None
+    if len(signer) != 32:
+        raise SignerError("bunker URI has an invalid signer public key")
+    query = urllib.parse.parse_qs(parts.query)
+    relays = [r for r in query.get("relay", []) if r.startswith(("ws://", "wss://"))]
+    secret = query.get("secret", [""])[0]
+    return signer, relays, secret
+
+
+def await_pairing(client_secret: bytes, relays: list, secret: str, timeout: float):
+    """Wait for a signer to answer the nostrconnect URI.
+
+    Listens on every connect relay at once and takes whichever answers first,
+    because a phone will only be able to reach some of them.
+    """
+    client_pubkey = public_key_from_secret(client_secret)
+    found = {}
+    stop = threading.Event()
+
+    def listen(relay):
+        try:
+            with WebSocket(relay, timeout) as ws:
+                subscription = os.urandom(8).hex()
+                ws.send_json(["REQ", subscription, {
+                    "kinds": [KIND_NIP46],
+                    "#p": [client_pubkey.hex()],
+                    "since": int(time.time()) - 60,
+                }])
+                ws.extend_deadline(timeout)
+                while not stop.is_set():
+                    message = ws.recv_json()
+                    if not isinstance(message, list) or len(message) < 3:
+                        continue
+                    if message[0] != "EVENT" or message[1] != subscription:
+                        continue
+                    event = message[2]
+                    try:
+                        signer_pubkey = bytes.fromhex(event.get("pubkey") or "")
+                        plaintext, scheme = _decrypt_from_signer(
+                            event.get("content") or "", client_secret, signer_pubkey
+                        )
+                        body = json.loads(plaintext)
+                    except (ValueError, Nip44Error, json.JSONDecodeError):
+                        continue
+                    if not isinstance(body, dict):
+                        continue
+                    # The ack echoes the secret from the URI; older signers
+                    # just say "ack".
+                    result = body.get("result")
+                    if result in (secret, "ack") or body.get("method") == "connect":
+                        found["signerPubkey"] = signer_pubkey.hex()
+                        found["encryption"] = scheme
+                        found["relay"] = relay
+                        stop.set()
+                        return
+        except (WebSocketError, OSError, ssl.SSLError):
+            return
+
+    threads = [threading.Thread(target=listen, args=(relay,), daemon=True) for relay in relays]
+    for thread in threads:
+        thread.start()
+    stop.wait(timeout)
+    return found or None
+
+
+# ---------------------------------------------------------------------- cli
+
+
+def emit(payload: dict) -> int:
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return 0
+
+
+def status_url(artist: str, title: str) -> str:
+    query_string = urllib.parse.quote(f"{artist} {title}".strip())
+    return f"https://music.youtube.com/search?q={query_string}"
+
+
+def cmd_identity(args, config) -> int:
+    pubkey = get_signer(config).pubkey()
+    return emit(
+        {
+            "ok": True,
+            "pubkey": pubkey.hex(),
+            "npub": bytes_to_bech32(pubkey, "npub"),
+            "mode": signing_mode(config),
+        }
+    )
+
+
+def cmd_profile(args, config) -> int:
+    pubkey = get_signer(config).pubkey()
+    npub = bytes_to_bech32(pubkey, "npub")
+    mode = signing_mode(config)
+
+    cached = load_cached_profile()
+    fresh_enough = (
+        cached.get("npub") == npub
+        and time.time() - cached.get("fetchedAt", 0) < args.max_age
+    )
+    if fresh_enough and not args.refresh:
+        return emit({"ok": True, "cached": True, "mode": mode, **cached})
+
+    events = query(
+        relays_from(config),
+        {"kinds": [KIND_METADATA], "authors": [pubkey.hex()], "limit": 1},
+        timeout=args.timeout,
+    )
+    event = newest_metadata_event(events)
+    if event is None:
+        if cached.get("npub") == npub:
+            return emit({"ok": True, "cached": True, "stale": True, "mode": mode, **cached})
+        return emit({
+            "ok": True,
+            "npub": npub,
+            "pubkey": pubkey.hex(),
+            "mode": mode,
+            "avatarPath": "",
+            "note": "no profile metadata published on these relays",
+        })
+
+    try:
+        content = json.loads(event.get("content") or "{}")
+    except json.JSONDecodeError:
+        content = {}
+
+    profile = {
+        "npub": npub,
+        "pubkey": pubkey.hex(),
+        "name": str(content.get("name") or ""),
+        "displayName": str(content.get("display_name") or content.get("displayName") or ""),
+        "about": str(content.get("about") or ""),
+        "nip05": str(content.get("nip05") or ""),
+        "picture": str(content.get("picture") or ""),
+        "avatarPath": "",
+        "fetchedAt": int(time.time()),
+    }
+    if profile["picture"]:
+        try:
+            profile["avatarPath"] = download_avatar(profile["picture"])
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            profile["avatarError"] = str(error)
+
+    store_cached_profile(profile)
+    return emit({"ok": True, "cached": False, "mode": mode, **profile})
+
+
+def cmd_now_playing(args, config) -> int:
+    artist = args.artist.strip()
+    title = args.title.strip()
+    album = (args.album or "").strip()
+    if not artist and not title:
+        return emit({"ok": False, "error": "need at least an artist or a title"})
+
+    result = {"ok": False, "content": f"{artist} - {title}".strip(" -")}
+
+    if not args.no_nostr:
+        signer = get_signer(config)
+        duration_seconds = max(0, args.duration_ms // 1000)
+        expiration = int(time.time()) + max(60, min(3600, duration_seconds + 15))
+        tags = [
+            ["d", STATUS_D_TAG],
+            ["r", status_url(artist, title)],
+            ["expiration", str(expiration)],
+        ]
+        try:
+            event = signer.sign(KIND_USER_STATUS, tags, result["content"])
+        except SignerError as error:
+            result["nostr"] = {"ok": False, "error": str(error)}
+        else:
+            result["nostr"] = publish(relays_from(config), event, timeout=args.timeout)
+            result["expiresAt"] = expiration
+    else:
+        result["nostr"] = {"ok": False, "skipped": True}
+
+    if not args.no_listenbrainz:
+        result["listenbrainz"] = listenbrainz_send(
+            config, artist, title, album, args.duration_ms, True, timeout=args.timeout
+        )
+    else:
+        result["listenbrainz"] = {"ok": False, "skipped": True}
+
+    result["ok"] = bool(result["nostr"].get("ok") or result["listenbrainz"].get("ok"))
+    return emit(result)
+
+
+def cmd_listen(args, config) -> int:
+    """Submit the completed play to ListenBrainz. Nostr has no equivalent —
+    NIP-38 is a live status, not a history — so this is ListenBrainz only."""
+    artist = args.artist.strip()
+    title = args.title.strip()
+    if not artist or not title:
+        return emit({"ok": False, "error": "a listen needs both an artist and a title"})
+
+    outcome = listenbrainz_send(
+        config,
+        artist,
+        title,
+        (args.album or "").strip(),
+        args.duration_ms,
+        False,
+        listened_at=args.listened_at or None,
+        timeout=args.timeout,
+    )
+    return emit({"ok": outcome.get("ok", False), "listenbrainz": outcome})
+
+
+def cmd_clear(args, config) -> int:
+    result = {"ok": False}
+    if not args.no_nostr:
+        try:
+            event = get_signer(config).sign(KIND_USER_STATUS, [["d", STATUS_D_TAG]], "")
+        except SignerError as error:
+            result["nostr"] = {"ok": False, "error": str(error)}
+        else:
+            result["nostr"] = publish(relays_from(config), event, timeout=args.timeout)
+            result["ok"] = result["nostr"]["ok"]
+    else:
+        result["nostr"] = {"ok": False, "skipped": True}
+    return emit(result)
+
+
+def _normalise_pubkey(value) -> str:
+    """`get_public_key` comes back as hex from some signers, npub from others."""
+    text = str(value or "").strip()
+    if text.startswith("npub1"):
+        return bech32_to_bytes(text, "npub").hex()
+    bytes.fromhex(text)  # raises if it is neither
+    return text
+
+
+def _finish_pairing(session: dict, timeout: float) -> int:
+    signer = RemoteSigner(session)
+    try:
+        user_pubkey = _normalise_pubkey(signer.request("get_public_key", [], timeout=timeout))
+    except (SignerError, ValueError) as error:
+        return emit({"stage": "done", "ok": False, "error": str(error)})
+
+    session["userPubkey"] = user_pubkey
+    session["encryption"] = signer.scheme
+    save_session(session)
+
+    return emit({
+        "stage": "done",
+        "ok": True,
+        "mode": "remote",
+        "pubkey": user_pubkey,
+        "npub": bytes_to_bech32(bytes.fromhex(user_pubkey), "npub"),
+        "encryption": signer.scheme,
+    })
+
+
+def cmd_login(args, config) -> int:
+    """Pair with a phone signer. Output is one JSON object per line: the QR
+    first so it can be displayed, then the result once the phone answers."""
+    if args.bunker:
+        try:
+            signer_pubkey, uri_relays, secret = parse_bunker_uri(args.bunker)
+        except SignerError as error:
+            return emit({"stage": "done", "ok": False, "error": str(error)})
+
+        client_secret = os.urandom(32)
+        relays = uri_relays or connect_relays_from(config)
+        session = {
+            "clientSecret": client_secret.hex(),
+            "signerPubkey": signer_pubkey.hex(),
+            "userPubkey": "",
+            "relays": relays,
+            "encryption": "nip44",
+        }
+        signer = RemoteSigner(session)
+        try:
+            signer.request("connect", [signer_pubkey.hex(), secret], timeout=args.wait)
+        except SignerError as error:
+            return emit({"stage": "done", "ok": False, "error": str(error)})
+        session["encryption"] = signer.scheme
+        return _finish_pairing(session, args.wait)
+
+    client_secret = os.urandom(32)
+    client_pubkey = public_key_from_secret(client_secret)
+    relays = connect_relays_from(config)
+    secret = os.urandom(16).hex()
+    uri = build_nostrconnect_uri(client_pubkey, relays, secret, args.name)
+
+    matrix = qr_matrix(uri)
+    emit({
+        "stage": "qr",
+        "uri": uri,
+        "matrix": matrix,
+        "size": len(matrix),
+        "relays": relays,
+        "expiresIn": int(args.wait),
+        # Without qrencode there is no matrix to draw, but the URI can still
+        # be copied into a signer by hand.
+        "qrAvailable": bool(matrix),
+    })
+
+    paired = await_pairing(client_secret, relays, secret, args.wait)
+    if not paired:
+        return emit({
+            "stage": "done",
+            "ok": False,
+            "error": "no signer answered — the code may have expired, or your "
+                     "phone could not reach the connect relays",
+        })
+
+    # Whichever relay the signer actually answered on is the one it is
+    # listening to; try it first for every later request.
+    ordered = [paired["relay"]] + [r for r in relays if r != paired["relay"]]
+    return _finish_pairing({
+        "clientSecret": client_secret.hex(),
+        "signerPubkey": paired["signerPubkey"],
+        "userPubkey": "",
+        "relays": ordered,
+        "encryption": paired["encryption"],
+    }, args.wait)
+
+
+def cmd_logout(args, config) -> int:
+    session = load_session()
+    if session and not args.keep_status:
+        # Retract the status while we can still sign for it.
+        try:
+            event = RemoteSigner(session).sign(KIND_USER_STATUS, [["d", STATUS_D_TAG]], "")
+            publish(relays_from(config), event, timeout=args.timeout)
+        except (SignerError, ValueError, OSError):
+            pass
+    return emit({"ok": delete_session(), "mode": signing_mode(config)})
+
+
+def cmd_listenbrainz_login(args, config) -> int:
+    """Sign in to ListenBrainz through its MusicBrainz-backed approval page.
+
+    Streams one JSON object per line: the approval URL first, so the interface
+    can show it while the browser opens, then the result.
+    """
+    if config.get("listenbrainzToken"):
+        return emit({
+            "stage": "done",
+            "ok": False,
+            "error": "a listenbrainzToken is set in the config file; remove it to sign in this way",
+        })
+
+    # A fresh random api_key per attempt. ListenBrainz does not validate it,
+    # and its token table is keyed on it — a shared constant would let two
+    # people signing in at once overwrite each other's pending token.
+    api_key = os.urandom(16).hex()
+    try:
+        token = listenbrainz_request_token(config, api_key, args.timeout)
+    except ListenBrainzError as error:
+        return emit({"stage": "done", "ok": False, "error": str(error)})
+
+    approve_url = f"{LISTENBRAINZ_AUTH_URL}?token={urllib.parse.quote(token)}"
+    opened = False if args.no_browser else open_in_browser(approve_url)
+    emit({
+        "stage": "auth",
+        "url": approve_url,
+        "opened": opened,
+        "expiresIn": int(args.wait),
+    })
+
+    deadline = time.monotonic() + args.wait
+    while time.monotonic() < deadline:
+        time.sleep(args.poll)
+        try:
+            session = listenbrainz_fetch_session(config, api_key, token, args.timeout)
+        except ListenBrainzError as error:
+            return emit({"stage": "done", "ok": False, "error": str(error)})
+        if session:
+            save_listenbrainz_session(session)
+            return emit({
+                "stage": "done",
+                "ok": True,
+                "mode": "session",
+                "username": session["username"],
+            })
+
+    return emit({
+        "stage": "done",
+        "ok": False,
+        "error": "timed out waiting for approval in the browser",
+    })
+
+
+def cmd_listenbrainz_logout(args, config) -> int:
+    return emit({"ok": delete_listenbrainz_session(), "mode": listenbrainz_mode(config)})
+
+
+def cmd_state(args, config) -> int:
+    """Everything the interface needs to render, with no network calls."""
+    mode = signing_mode(config)
+    npub = ""
+    if mode != "none":
+        try:
+            npub = bytes_to_bech32(get_signer(config).pubkey(), "npub")
+        except (ConfigError, SignerError, ValueError):
+            mode = "none"
+
+    listenbrainz = load_listenbrainz_session() or {}
+    return emit({
+        "ok": True,
+        "signing": {"mode": mode, "npub": npub},
+        "listenbrainz": {
+            "mode": listenbrainz_mode(config),
+            "username": str(listenbrainz.get("username") or ""),
+        },
+    })
+
+
+def cmd_doctor(args, config) -> int:
+    report = {"ok": False, "configPath": args.config, "mode": signing_mode(config), "checks": []}
+
+    def check(name, ok, detail=""):
+        report["checks"].append({"name": name, "ok": bool(ok), "detail": str(detail)})
+        return ok
+
+    label = {
+        "remote": "signing key (phone signer, NIP-46)",
+        "local": "signing key (local nsec)",
+        "none": "signing key",
+    }[report["mode"]]
+    try:
+        pubkey = get_signer(config).pubkey()
+        npub = bytes_to_bech32(pubkey, "npub")
+        signing_ok = check(label, True, npub)
+        report["npub"] = npub
+    except (ConfigError, SignerError, ValueError) as error:
+        signing_ok = check(label, False, error)
+        pubkey = None
+
+    relays = relays_from(config)
+    reachable = 0
+    for url in relays:
+        try:
+            WebSocket(url, timeout=args.timeout).close()
+            check(f"relay {url}", True)
+            reachable += 1
+        except (WebSocketError, OSError, ssl.SSLError) as error:
+            check(f"relay {url}", False, error)
+
+    lb_mode = listenbrainz_mode(config)
+    report["listenbrainzMode"] = lb_mode
+    token = config.get("listenbrainzToken")
+    if lb_mode == "session":
+        stored = load_listenbrainz_session() or {}
+        listenbrainz_ok = check(
+            "listenbrainz (signed in)", True, stored.get("username", "")
+        )
+    elif not token:
+        check("listenbrainz", False, "not connected — run `listenbrainz-login` (Nostr-only until then)")
+        listenbrainz_ok = None
+    else:
+        base = str(config.get("listenbrainzUrl") or DEFAULT_LISTENBRAINZ_URL).rstrip("/")
+        request = urllib.request.Request(
+            f"{base}/1/validate-token",
+            headers={"Authorization": f"Token {token}", "User-Agent": USER_AGENT},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=args.timeout) as response:
+                body = json.loads(response.read().decode("utf-8", "replace"))
+            listenbrainz_ok = check(
+                "listenbrainz", body.get("valid", False), body.get("user_name", "")
+            )
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            listenbrainz_ok = check("listenbrainz", False, error)
+
+    report["ok"] = bool(signing_ok and reachable and listenbrainz_ok is not False)
+    return emit(report)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omarchy-scrobble",
+        description="Publish now-playing music to Nostr (NIP-38) and ListenBrainz.",
+    )
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--config", default=config_path(), help="path to config.json")
+    parser.add_argument("--timeout", type=float, default=8.0, help="network timeout in seconds")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    identity = subparsers.add_parser("identity", help="print the configured npub")
+    identity.set_defaults(handler=cmd_identity)
+
+    profile = subparsers.add_parser("profile", help="fetch the Nostr profile and avatar")
+    profile.add_argument("--refresh", action="store_true", help="ignore the cache")
+    profile.add_argument("--max-age", type=int, default=21600, help="cache lifetime in seconds")
+    profile.set_defaults(handler=cmd_profile)
+
+    now_playing = subparsers.add_parser(
+        "now-playing", help="publish a NIP-38 status and a ListenBrainz playing-now"
+    )
+    now_playing.add_argument("--artist", required=True)
+    now_playing.add_argument("--title", required=True)
+    now_playing.add_argument("--album", default="")
+    now_playing.add_argument("--duration-ms", type=int, default=0, dest="duration_ms")
+    now_playing.add_argument("--no-nostr", action="store_true")
+    now_playing.add_argument("--no-listenbrainz", action="store_true")
+    now_playing.set_defaults(handler=cmd_now_playing)
+
+    listen = subparsers.add_parser("listen", help="submit a completed listen to ListenBrainz")
+    listen.add_argument("--artist", required=True)
+    listen.add_argument("--title", required=True)
+    listen.add_argument("--album", default="")
+    listen.add_argument("--duration-ms", type=int, default=0, dest="duration_ms")
+    listen.add_argument("--listened-at", type=int, default=0, dest="listened_at")
+    listen.set_defaults(handler=cmd_listen)
+
+    clear = subparsers.add_parser("clear", help="clear the NIP-38 status")
+    clear.add_argument("--no-nostr", action="store_true")
+    clear.set_defaults(handler=cmd_clear)
+
+    login = subparsers.add_parser(
+        "login", help="pair a phone signer by QR code (NIP-46), or a bunker:// URI"
+    )
+    login.add_argument("--bunker", default="", help="pair from a bunker:// URI instead of a QR")
+    login.add_argument("--name", default="Omarchy Scrobble", help="name shown in the signer app")
+    # Its own flag rather than reusing --timeout: a subparser default would
+    # silently clobber an explicit global --timeout.
+    login.add_argument(
+        "--wait", type=float, default=CONNECT_TIMEOUT,
+        help="seconds to wait for the phone to scan the code",
+    )
+    login.set_defaults(handler=cmd_login)
+
+    logout = subparsers.add_parser("logout", help="forget the paired signer")
+    logout.add_argument("--keep-status", action="store_true", help="leave the Nostr status in place")
+    logout.set_defaults(handler=cmd_logout)
+
+    lb_login = subparsers.add_parser(
+        "listenbrainz-login", help="sign in to ListenBrainz via its MusicBrainz approval page"
+    )
+    lb_login.add_argument("--no-browser", action="store_true", help="print the URL, do not open it")
+    lb_login.add_argument(
+        "--wait", type=float, default=300.0, help="seconds to wait for approval"
+    )
+    lb_login.add_argument("--poll", type=float, default=3.0, help="seconds between checks")
+    lb_login.set_defaults(handler=cmd_listenbrainz_login)
+
+    lb_logout = subparsers.add_parser("listenbrainz-logout", help="forget the ListenBrainz session")
+    lb_logout.set_defaults(handler=cmd_listenbrainz_logout)
+
+    state = subparsers.add_parser("state", help="print signing and ListenBrainz status, offline")
+    state.set_defaults(handler=cmd_state)
+
+    doctor = subparsers.add_parser("doctor", help="check config, relays and tokens")
+    doctor.set_defaults(handler=cmd_doctor)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        config = read_config(args.config)
+    except ConfigError as error:
+        return emit({"ok": False, "error": str(error), "configPath": args.config})
+
+    try:
+        return args.handler(args, config)
+    except ConfigError as error:
+        return emit({"ok": False, "error": str(error)})
+    except Exception as error:  # noqa: BLE001 - the caller only ever reads JSON
+        return emit({"ok": False, "error": f"{error.__class__.__name__}: {error}"})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

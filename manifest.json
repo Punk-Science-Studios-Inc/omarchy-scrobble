@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.punkscience.omarchy-scrobble",
+  "name": "Scrobble",
+  "version": "1.2.0",
+  "author": "Darryl G. Wright",
+  "license": "MIT",
+  "description": "Publish the currently playing track to your Nostr status (NIP-38) and to ListenBrainz.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Scrobble",
+    "description": "Now playing, published to Nostr and ListenBrainz. Hover for your identity and the current track.",
+    "category": "Media",
+    "aliases": [
+      "scrobble",
+      "nostr",
+      "listenbrainz",
+      "music",
+      "now playing"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "enabled": true,
+      "publishNostr": true,
+      "publishListenBrainz": true,
+      "playerFilter": "",
+      "settleSeconds": 5
+    },
+    "schema": [
+      {
+        "key": "enabled",
+        "type": "boolean",
+        "label": "Publishing enabled",
+        "description": "Master switch. Turning this off clears your Nostr status.",
+        "defaultValue": true
+      },
+      {
+        "key": "publishNostr",
+        "type": "boolean",
+        "label": "Publish to Nostr",
+        "description": "Set a NIP-38 music status (kind 30315) on your Nostr profile.",
+        "defaultValue": true
+      },
+      {
+        "key": "publishListenBrainz",
+        "type": "boolean",
+        "label": "Publish to ListenBrainz",
+        "description": "Send a now-playing, then a listen once the track has played long enough.",
+        "defaultValue": true
+      },
+      {
+        "key": "playerFilter",
+        "type": "string",
+        "label": "Only this player",
+        "description": "Match part of a player's name, such as spotify or chromium. Leave empty to follow whatever is playing.",
+        "defaultValue": ""
+      },
+      {
+        "key": "settleSeconds",
+        "type": "integer",
+        "label": "Settle delay (seconds)",
+        "description": "How long a track must play before it is published, so skipping through an album does not spam the relays.",
+        "min": 0,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}
