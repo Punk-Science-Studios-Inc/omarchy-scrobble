@@ -31,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 USER_AGENT = f"omarchy-scrobble/{VERSION}"
 
 DEFAULT_RELAYS = [
@@ -46,6 +46,8 @@ KIND_USER_STATUS = 30315  # NIP-38
 STATUS_D_TAG = "music"
 
 MAX_AVATAR_BYTES = 4 * 1024 * 1024
+MAX_HTTP_RESPONSE_BYTES = 1024 * 1024        # 1 MiB cap on any HTTP response we parse
+MAX_WS_PAYLOAD_BYTES = 256 * 1024             # 256 KiB cap on any WebSocket frame payload
 
 
 # --------------------------------------------------------------------- paths
@@ -722,6 +724,10 @@ class WebSocket:
             length = struct.unpack("!H", self._read_exactly(2))[0]
         elif length == 127:
             length = struct.unpack("!Q", self._read_exactly(8))[0]
+        if length > MAX_WS_PAYLOAD_BYTES:
+            raise WebSocketError(
+                f"frame payload exceeds {MAX_WS_PAYLOAD_BYTES} bytes"
+            )
         mask = self._read_exactly(4) if masked else None
         payload = self._read_exactly(length) if length else b""
         if mask:
@@ -756,6 +762,10 @@ class WebSocket:
                 pending_is_text = opcode == 0x1
             else:
                 raise WebSocketError(f"unexpected websocket opcode {opcode}")
+            if len(pending) > MAX_WS_PAYLOAD_BYTES:
+                raise WebSocketError(
+                    f"defragmented payload exceeds {MAX_WS_PAYLOAD_BYTES} bytes"
+                )
             if not fin:
                 continue
             if not pending_is_text:
@@ -996,10 +1006,20 @@ def listenbrainz_submit(config: dict, payload: dict, timeout: float = 8.0) -> di
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read()
+            body = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+            if len(body) > MAX_HTTP_RESPONSE_BYTES:
+                return {
+                    "ok": False,
+                    "status": response.status,
+                    "detail": f"response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes",
+                }
             return {"ok": True, "status": response.status}
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", "replace")[:300]
+        body = error.read(MAX_HTTP_RESPONSE_BYTES + 1)
+        if len(body) > MAX_HTTP_RESPONSE_BYTES:
+            detail = f"error response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+        else:
+            detail = body.decode("utf-8", "replace")[:300]
         return {"ok": False, "status": error.code, "detail": detail}
     except (urllib.error.URLError, OSError, ValueError) as error:
         return {"ok": False, "detail": str(error)}
@@ -1138,11 +1158,17 @@ def compat_call(url: str, params: dict, method: str = "GET", timeout: float = 15
             f"{url}?{encoded}", headers={"User-Agent": USER_AGENT}
         )
 
+    def _read_body(src):
+        data = src.read(MAX_HTTP_RESPONSE_BYTES + 1)
+        if len(data) > MAX_HTTP_RESPONSE_BYTES:
+            raise ListenBrainzError(f"response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes")
+        return data.decode("utf-8", "replace")
+
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", "replace")
+            body = _read_body(response)
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", "replace")
+        body = _read_body(error)
         try:
             parsed = json.loads(body)
         except json.JSONDecodeError:
@@ -2046,10 +2072,17 @@ def cmd_doctor(args, config) -> int:
         )
         try:
             with urllib.request.urlopen(request, timeout=args.timeout) as response:
-                body = json.loads(response.read().decode("utf-8", "replace"))
-            listenbrainz_ok = check(
-                "listenbrainz", body.get("valid", False), body.get("user_name", "")
-            )
+                raw = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_HTTP_RESPONSE_BYTES:
+                    listenbrainz_ok = check(
+                        "listenbrainz", False,
+                        f"response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+                    )
+                else:
+                    body = json.loads(raw.decode("utf-8", "replace"))
+                    listenbrainz_ok = check(
+                        "listenbrainz", body.get("valid", False), body.get("user_name", "")
+                    )
         except (urllib.error.URLError, OSError, ValueError) as error:
             listenbrainz_ok = check("listenbrainz", False, error)
 

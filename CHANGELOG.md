@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1
+
+Harden against unbounded memory use from malicious endpoints.
+
+- Cap ListenBrainz HTTP responses at 1 MiB before parsing; reject anything
+  oversized or truncated
+- Cap WebSocket relay frame payloads at 256 KiB; reject oversized frames
+  and defragmented messages before they are retained
+
 ## 1.2.0
 
 Connect ListenBrainz from the card, no token to copy.

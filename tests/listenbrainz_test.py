@@ -71,6 +71,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._reply({"session": {"name": "punkscience", "key": "sess-key-1"}})
             else:
                 self._reply({"code": 14, "message": "This token has not been authorized"}, status=401)
+        elif method == "oversized":
+            # Send exactly one byte over the 1 MiB cap so the client can
+            # read the whole body, detect the oversize, and close cleanly.
+            padding = helper.MAX_HTTP_RESPONSE_BYTES + 1 - len(json.dumps({"x": ""}).encode())
+            self._reply({"x": "x" * padding})
         else:
             self._reply({"error": "unknown"}, status=400)
 
@@ -82,10 +87,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._reply({"scrobbles": {"@attr": {"accepted": 1, "ignored": 0}}})
 
 
+class OversizedNativeHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        # Exactly one byte over the 1 MiB cap so the client reads the whole
+        # body, detects the oversize, and closes without a connection reset.
+        blob = b"x" * (helper.MAX_HTTP_RESPONSE_BYTES + 1)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(blob)))
+        self.end_headers()
+        self.wfile.write(blob)
+
+
 server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{server.server_address[1]}/2.0/"
 CONFIG = {"listenbrainzCompatUrl": BASE}
+
+native_server = http.server.HTTPServer(("127.0.0.1", 0), OversizedNativeHandler)
+threading.Thread(target=native_server.serve_forever, daemon=True).start()
+NATIVE_BASE = f"http://127.0.0.1:{native_server.server_address[1]}/"
 
 os.environ["XDG_DATA_HOME"] = os.path.join(HERE, "_tmp_lb_state")
 shutil.rmtree(os.environ["XDG_DATA_HOME"], ignore_errors=True)
@@ -160,8 +184,27 @@ check("and returns to unconnected", helper.listenbrainz_mode(CONFIG) == "none")
 check("unconnected submissions are skipped, not failed",
       helper.listenbrainz_send(CONFIG, "a", "b", "", 0, True).get("skipped") is True)
 
+# --------------------------------------------------------------- size limits
+
+print("size limits")
+try:
+    helper.compat_call(BASE, {"method": "oversized", "format": "json"}, timeout=10)
+    check("oversized compat response is rejected", False)
+except helper.ListenBrainzError as e:
+    check("oversized compat response is rejected", "exceeds" in str(e).lower(), e)
+
+result = helper.listenbrainz_submit(
+    {"listenbrainzToken": "abc", "listenbrainzUrl": NATIVE_BASE},
+    {"listen_type": "playing_now", "payload": []},
+    timeout=10,
+)
+check("oversized native API response is rejected",
+      not result["ok"] and "exceeds" in result.get("detail", "").lower(),
+      result.get("detail"))
+
 shutil.rmtree(os.environ["XDG_DATA_HOME"], ignore_errors=True)
 server.shutdown()
+native_server.shutdown()
 
 print()
 if failures:

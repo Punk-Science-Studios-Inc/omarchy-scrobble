@@ -8,9 +8,14 @@ failure paths (rejection, dead host) that a real relay will not perform on cue.
 Run: python3 tests/relay_test.py
 """
 
+import base64
+import hashlib
 import importlib.util
 import os
+import socket
+import struct
 import sys
+import threading
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -93,6 +98,49 @@ check(
     accepting.received[-1][1]["content"] == "Björk – Jóga ♪",
     accepting.received[-1][1]["content"],
 )
+
+print("frame limits")
+
+def oversized_relay():
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+
+    def serve():
+        conn, _ = sock.accept()
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += conn.recv(4096)
+        key = ""
+        for line in buf.decode("latin-1").split("\r\n"):
+            if line.lower().startswith("sec-websocket-key:"):
+                key = line.split(":", 1)[1].strip()
+        accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        ).decode()
+        conn.sendall((
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).encode())
+        payload = b"x" * (helper.MAX_WS_PAYLOAD_BYTES + 1)
+        head = bytearray([0x81])  # fin=1, opcode=text
+        head.append(127)
+        head += struct.pack("!Q", len(payload))
+        conn.sendall(bytes(head) + payload)
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"ws://127.0.0.1:{port}/"
+
+url = oversized_relay()
+try:
+    with helper.WebSocket(url, timeout=5) as ws:
+        ws.recv_json()
+    check("oversized websocket frame is rejected", False)
+except helper.WebSocketError as e:
+    check("oversized websocket frame is rejected", "exceeds" in str(e).lower(), e)
 
 print()
 if failures:

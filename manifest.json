@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.punkscience.omarchy-scrobble",
   "name": "Scrobble",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "Darryl G. Wright",
   "license": "Unlicense",
   "description": "Publish the currently playing track to your Nostr status (NIP-38) and to ListenBrainz.",
