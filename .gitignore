@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 tests/_tmp_state/
 tests/_tmp_lb_state/
+CLAUDE.md
+AGENTS.md
