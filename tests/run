@@ -25,3 +25,7 @@ python3 tests/nip46_test.py
 echo
 echo "== listenbrainz (python) =="
 python3 tests/listenbrainz_test.py
+
+echo
+echo "== security review blockers (python) =="
+python3 tests/security_test.py

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.2
+
+Address the marketplace security review (submission #6347).
+
+- Run the helper through a fixed interpreter (`/usr/bin/python3`) from
+  `Service.qml` instead of relying on its `env` shebang and ambient `PATH`
+- Read `config.json` and the secret session files through retained no-follow
+  descriptors with size, type, owner and link checks; refuse symlinks and
+  oversized input rather than following a pathname and stat-ing afterwards
+- Write secret session files with randomized exclusive staging and `fsync`
+  instead of a predictable `.part` path
+- Send ListenBrainz credentials only to first-party HTTPS origins
+  (`api.listenbrainz.org`, `listenbrainz.org`); refuse any other configured URL
+
 ## 1.2.1
 
 Harden against unbounded memory use from malicious endpoints.

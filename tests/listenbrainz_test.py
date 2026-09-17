@@ -31,6 +31,11 @@ spec = importlib.util.spec_from_loader(
 helper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper)
 
+# The production client only sends credentials to first-party HTTPS origins.
+# These local HTTP stubs are deliberately enabled by replacing that validator
+# inside this test process; no runtime configuration can bypass it.
+helper.trusted_listenbrainz_url = lambda value, default: str(value or default)
+
 failures = []
 
 

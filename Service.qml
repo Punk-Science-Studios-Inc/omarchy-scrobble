@@ -31,6 +31,11 @@ Item {
     return url.replace(/\/$/, "")
   }
   readonly property string helperPath: pluginDir + "/bin/omarchy-scrobble"
+  readonly property string pythonPath: "/usr/bin/python3"
+
+  function helperCommand(helperArgs) {
+    return [pythonPath, helperPath].concat(helperArgs)
+  }
 
   // ------------------------------------------------------------- settings
 
@@ -182,14 +187,14 @@ Item {
 
     publishing = true
     nowPlayingProcess.pendingSignature = signature
-    nowPlayingProcess.command = [
-      helperPath, "now-playing",
+    nowPlayingProcess.command = helperCommand([
+      "now-playing",
       "--artist", artist,
       "--title", title,
       "--album", album,
       "--duration-ms", String(durationMs)
     ].concat(publishNostr ? [] : ["--no-nostr"])
-     .concat(publishListenBrainz ? [] : ["--no-listenbrainz"])
+     .concat(publishListenBrainz ? [] : ["--no-listenbrainz"]))
     nowPlayingProcess.running = true
   }
 
@@ -203,13 +208,13 @@ Item {
     if (!Model.shouldSubmitListen(durationMs, playedMs)) return
 
     listenedSignature = signature
-    listenProcess.command = [
-      helperPath, "listen",
+    listenProcess.command = helperCommand([
+      "listen",
       "--artist", artist,
       "--title", title,
       "--album", album,
       "--duration-ms", String(durationMs)
-    ]
+    ])
     listenProcess.running = true
   }
 
@@ -220,7 +225,7 @@ Item {
     publishedNostr = false
     publishedListenBrainz = false
     if (!publishNostr) return
-    clearProcess.command = [helperPath, "clear"]
+    clearProcess.command = helperCommand(["clear"])
     clearProcess.running = true
   }
 
@@ -228,8 +233,8 @@ Item {
     if (profileLoading || profileProcess.running) return
     profileLoading = true
     profileProcess.command = force
-      ? [helperPath, "profile", "--refresh"]
-      : [helperPath, "profile"]
+      ? helperCommand(["profile", "--refresh"])
+      : helperCommand(["profile"])
     profileProcess.running = true
   }
 
@@ -237,7 +242,7 @@ Item {
 
   function refreshState() {
     if (stateProcess.running) return
-    stateProcess.command = [helperPath, "state"]
+    stateProcess.command = helperCommand(["state"])
     stateProcess.running = true
   }
 
@@ -247,7 +252,7 @@ Item {
     lbLoginOpened = false
     lbLoginError = ""
     lbLoginActive = true
-    lbLoginProcess.command = [helperPath, "listenbrainz-login"]
+    lbLoginProcess.command = helperCommand(["listenbrainz-login"])
     lbLoginProcess.running = true
   }
 
@@ -260,7 +265,7 @@ Item {
   function listenbrainzLogout() {
     if (lbLogoutProcess.running) return
     cancelListenBrainzLogin()
-    lbLogoutProcess.command = [helperPath, "listenbrainz-logout"]
+    lbLogoutProcess.command = helperCommand(["listenbrainz-logout"])
     lbLogoutProcess.running = true
   }
 
@@ -300,7 +305,7 @@ Item {
     loginQrAvailable = false
     loginError = ""
     loginActive = true
-    loginProcess.command = [helperPath, "login", "--name", "Omarchy Scrobble"]
+    loginProcess.command = helperCommand(["login", "--name", "Omarchy Scrobble"])
     loginProcess.running = true
   }
 
@@ -315,7 +320,7 @@ Item {
   function logout() {
     if (logoutProcess.running) return
     cancelLogin()
-    logoutProcess.command = [helperPath, "logout"]
+    logoutProcess.command = helperCommand(["logout"])
     logoutProcess.running = true
   }
 
