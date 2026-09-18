@@ -29,3 +29,7 @@ python3 tests/listenbrainz_test.py
 echo
 echo "== security review blockers (python) =="
 python3 tests/security_test.py
+
+echo
+echo "== last.fm (python) =="
+python3 tests/lastfm_test.py

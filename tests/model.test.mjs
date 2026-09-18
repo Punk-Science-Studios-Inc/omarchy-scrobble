@@ -133,6 +133,11 @@ assert.equal(context.statusText({ ...base, lastError: "relay refused" }), "relay
 assert.equal(context.statusText(base), "Published to Nostr · ListenBrainz")
 assert.equal(context.statusText({ ...base, publishedListenBrainz: false }), "Published to Nostr")
 assert.equal(context.statusText({ ...base, publishedNostr: false }), "Published to ListenBrainz")
+const withLastFm = { ...base, publishedLastFm: true }
+assert.equal(context.statusText(withLastFm), "Published to Nostr · ListenBrainz · Last.fm")
+assert.equal(context.statusText({ ...withLastFm, publishedNostr: false }), "Published to ListenBrainz · Last.fm")
+assert.equal(context.statusText({ ...withLastFm, publishedListenBrainz: false }), "Published to Nostr · Last.fm")
+assert.equal(context.statusText({ ...withLastFm, publishedNostr: false, publishedListenBrainz: false }), "Published to Last.fm")
 assert.equal(
   context.statusText({ ...base, publishedNostr: false, publishedListenBrainz: false }),
   "Not published"

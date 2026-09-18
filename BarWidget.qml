@@ -53,6 +53,14 @@ BarWidget {
   readonly property bool lbLoginOpened: service ? service.lbLoginOpened : false
   readonly property string lbLoginError: service ? service.lbLoginError : ""
 
+  readonly property string lastfmMode: service ? service.lastfmMode : "none"
+  readonly property string lastfmUser: service ? service.lastfmUser : ""
+  readonly property bool lastfmConnected: service ? service.lastfmConnected : false
+  readonly property bool lfLoginActive: service ? service.lfLoginActive : false
+  readonly property string lfLoginUrl: service ? service.lfLoginUrl : ""
+  readonly property bool lfLoginOpened: service ? service.lfLoginOpened : false
+  readonly property string lfLoginError: service ? service.lfLoginError : ""
+
   readonly property string durationText: Model.formatDuration(durationMs)
   readonly property string identityText: Model.identityLabel(profile)
 
@@ -68,7 +76,7 @@ BarWidget {
 
   // While a QR is on screen the card stays put: it is meant to be looked at
   // through a phone camera, not kept alive by holding the cursor still.
-  readonly property bool pinned: loginActive || lbLoginActive
+  readonly property bool pinned: loginActive || lbLoginActive || lfLoginActive
 
   readonly property bool opened: popupOpen
   function open() { closeDelay.stop(); popupOpen = true }
@@ -79,6 +87,7 @@ BarWidget {
     // one waiting on the relays would be worse than making you scan again.
     if (loginActive && service) service.cancelLogin()
     if (lbLoginActive && service) service.cancelListenBrainzLogin()
+    if (lfLoginActive && service) service.cancelLastFmLogin()
   }
   function toggle() { if (popupOpen) close(); else open() }
 
@@ -176,6 +185,10 @@ BarWidget {
       root.open()
       if (root.service) root.service.startListenBrainzLogin()
     }
+    function lastfmLogin(): void {
+      root.open()
+      if (root.service) root.service.startLastFmLogin()
+    }
   }
 
   // ------------------------------------------------------------ hover card
@@ -252,6 +265,67 @@ BarWidget {
             bordered: true
             focusable: true
             onClicked: if (root.service) root.service.cancelListenBrainzLogin()
+          }
+        }
+      }
+
+      // -- last.fm sign-in: approve in a browser
+
+      Column {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.lfLoginActive
+
+        Text {
+          width: parent.width
+          text: "Approve in your browser"
+          color: root.bar.foreground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+
+        Text {
+          width: parent.width
+          text: root.lfLoginUrl === ""
+            ? "Asking Last.fm for a token…"
+            : (root.lfLoginOpened
+                ? "A Last.fm page has opened. Sign in and press Approve — this card updates by itself."
+                : "Open this page, sign in and press Approve:")
+          color: Qt.darker(root.bar.foreground, 1.4)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          width: parent.width
+          visible: root.lfLoginUrl !== "" && !root.lfLoginOpened
+          text: root.lfLoginUrl
+          color: Qt.darker(root.bar.foreground, 1.2)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WrapAnywhere
+        }
+
+        Row {
+          spacing: Style.space(6)
+
+          Button {
+            visible: root.lfLoginUrl !== ""
+            text: "Open again"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: Quickshell.execDetached(["xdg-open", root.lfLoginUrl])
+          }
+
+          Button {
+            text: "Cancel"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: if (root.service) root.service.cancelLastFmLogin()
           }
         }
       }
@@ -361,7 +435,7 @@ BarWidget {
       Row {
         width: parent.width
         spacing: Style.space(10)
-        visible: !root.loginActive && !root.lbLoginActive
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
 
         Rectangle {
           id: avatarFrame
@@ -433,7 +507,7 @@ BarWidget {
 
       PanelSeparator {
         foreground: root.bar.foreground
-        visible: !root.loginActive && !root.lbLoginActive
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
       }
 
       // -- current track
@@ -441,7 +515,7 @@ BarWidget {
       Row {
         width: parent.width
         spacing: Style.space(10)
-        visible: !root.loginActive && !root.lbLoginActive && root.trackLine !== ""
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.trackLine !== ""
 
         Rectangle {
           id: artFrame
@@ -500,7 +574,7 @@ BarWidget {
 
       Text {
         width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && root.trackLine === ""
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.trackLine === ""
         text: "Nothing playing"
         color: Qt.darker(root.bar.foreground, 1.5)
         font.family: root.bar.fontFamily
@@ -509,7 +583,7 @@ BarWidget {
 
       PanelSeparator {
         foreground: root.bar.foreground
-        visible: !root.loginActive && !root.lbLoginActive
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
       }
 
       // -- what the plugin is doing about it
@@ -517,7 +591,7 @@ BarWidget {
       Row {
         width: parent.width
         spacing: Style.space(6)
-        visible: !root.loginActive && !root.lbLoginActive
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
 
         Rectangle {
           width: Style.space(7)
@@ -539,7 +613,7 @@ BarWidget {
 
       Text {
         width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && root.playerName !== ""
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.playerName !== ""
         text: "Source: " + root.playerName
         color: Qt.darker(root.bar.foreground, 1.7)
         font.family: root.bar.fontFamily
@@ -549,7 +623,7 @@ BarWidget {
 
       Text {
         width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
         text: root.listenbrainzConnected
           ? ("ListenBrainz: " + (root.listenbrainzUser !== "" ? root.listenbrainzUser : "connected"))
           : "ListenBrainz: not connected"
@@ -561,7 +635,19 @@ BarWidget {
 
       Text {
         width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && root.lbLoginError !== ""
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
+        text: root.lastfmConnected
+          ? ("Last.fm: " + (root.lastfmUser !== "" ? root.lastfmUser : "connected"))
+          : "Last.fm: not connected"
+        color: Qt.darker(root.bar.foreground, root.lastfmConnected ? 1.4 : 1.7)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      Text {
+        width: parent.width
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.lbLoginError !== ""
         text: root.lbLoginError
         color: root.bar.urgent
         font.family: root.bar.fontFamily
@@ -571,7 +657,17 @@ BarWidget {
 
       Text {
         width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && root.loginError !== ""
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.lfLoginError !== ""
+        text: root.lfLoginError
+        color: root.bar.urgent
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+
+      Text {
+        width: parent.width
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.loginError !== ""
         text: root.loginError
         color: root.bar.urgent
         font.family: root.bar.fontFamily
@@ -582,7 +678,7 @@ BarWidget {
       Row {
         width: parent.width
         spacing: Style.space(6)
-        visible: !root.loginActive && !root.lbLoginActive
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
 
         Button {
           visible: !root.configured
@@ -619,11 +715,29 @@ BarWidget {
           focusable: true
           onClicked: if (root.service) root.service.listenbrainzLogout()
         }
+
+        Button {
+          visible: !root.lastfmConnected
+          text: "Connect Last.fm"
+          foreground: root.bar.foreground
+          bordered: true
+          focusable: true
+          onClicked: if (root.service) root.service.startLastFmLogin()
+        }
+
+        Button {
+          visible: root.lastfmMode === "session"
+          text: "Disconnect Last.fm"
+          foreground: root.bar.foreground
+          bordered: true
+          focusable: true
+          onClicked: if (root.service) root.service.lastfmLogout()
+        }
       }
 
       Text {
         width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && root.configured
+        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.configured
         text: "Click to " + (root.publishingEnabled ? "pause" : "resume") + " publishing · middle click refreshes your profile"
         color: Qt.darker(root.bar.foreground, 1.8)
         font.family: root.bar.fontFamily

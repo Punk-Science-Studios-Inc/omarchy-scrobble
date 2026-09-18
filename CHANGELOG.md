@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.4.0
+
+Ship Last.fm app credentials with the plugin, so users never register anything.
+
+- Bake the registered app's API key and shared secret into the helper;
+  **Connect Last.fm** now works with a single click out of the box, with no
+  `lastfmApiKey`/`lastfmApiSecret` in the config file
+- The shared secret authorizes this app, not the user — Last.fm's approval
+  page mints the account-specific session key, which is the only credential
+  that can submit listens, and it stays locked to mode 0600 on the user's box
+- The shipped pair can be overridden for emergency rotation via the
+  `LASTFM_API_KEY` and `LASTFM_API_SECRET` environment variables
+- Drop `lastfmApiKey` and `lastfmApiSecret` from `config.example.json` and
+  the README; Last.fm is now configured to mirror the ListenBrainz flow
+
+## 1.3.0
+
+Add Last.fm scrobbling alongside Nostr and ListenBrainz.
+
+- Connect Last.fm from the bar card through the official desktop approval flow
+- Publish now-playing updates and completed listens with signed API requests
+- Store the Last.fm session using the same bounded, no-follow private-file
+  handling as the Nostr and ListenBrainz sessions
+- Restrict Last.fm credential-bearing requests to the official HTTPS API origin
+- Add local stub-server coverage for authentication, signatures, submissions,
+  and session handling
+
 ## 1.2.3
 
 Address the second round of marketplace security review (submission #6347).

@@ -118,6 +118,24 @@ here. Listens submitted this way land in exactly the same place as native ones.
 **Disconnect ListenBrainz** in the card forgets the session, which is stored at
 `~/.local/share/omarchy-scrobble/listenbrainz.json` (mode 0600).
 
+## Connect Last.fm
+
+Click **Connect Last.fm** in the card. The helper opens Last.fm's approval
+page; sign in and press **Yes, allow access**. The card polls for approval
+and stores the resulting session at `~/.local/share/omarchy-scrobble/lastfm.json`
+(mode 0600). It stores the session key, not your Last.fm password. **Disconnect
+Last.fm** removes the session.
+
+There is nothing to set up first — nowhere to register, nothing to paste.
+The plugin ships the API key and shared secret for the registered app it was
+built from; Last.fm's desktop flow then mints an account-specific session key
+after you approve the request in your browser, and that session key is the
+only credential that can submit listens to your account.
+
+Last.fm credentials are sent only to the official HTTPS API origin
+(`ws.audioscrobbler.com`). Like every open-source Last.fm client, the app
+secret is baked into the plugin — it authorizes this app, not your account.
+
 If you would rather paste a token, put one in the config file as
 `listenbrainzToken` — it takes precedence over a session, and uses the native
 API instead.
