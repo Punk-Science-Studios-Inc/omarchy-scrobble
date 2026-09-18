@@ -46,6 +46,7 @@ Item {
   readonly property bool publishingEnabled: Model.boolSetting(settings.enabled, true)
   readonly property bool publishNostr: Model.boolSetting(settings.publishNostr, true)
   readonly property bool publishListenBrainz: Model.boolSetting(settings.publishListenBrainz, true)
+  readonly property bool publishLastFm: Model.boolSetting(settings.publishLastFm, true)
   readonly property string playerFilter: Model.textSetting(settings.playerFilter, "")
   readonly property int settleSeconds: Model.intSetting(settings.settleSeconds, 5, 0, 60)
 
@@ -131,6 +132,7 @@ Item {
   property bool publishing: false
   property bool publishedNostr: false
   property bool publishedListenBrainz: false
+  property bool publishedLastFm: false
   property string lastError: ""
 
   property var profile: null
@@ -155,6 +157,15 @@ Item {
   property string lbLoginUrl: ""
   property bool lbLoginOpened: false
   property string lbLoginError: ""
+
+  // Last.fm signs in separately, through its own approval page.
+  property string lastfmMode: "none"
+  property string lastfmUser: ""
+  readonly property bool lastfmConnected: lastfmMode !== "none"
+  property bool lfLoginActive: false
+  property string lfLoginUrl: ""
+  property bool lfLoginOpened: false
+  property string lfLoginError: ""
   readonly property string npub: profile ? String(profile.npub || "") : ""
   readonly property string avatarPath: profile ? String(profile.avatarPath || "") : ""
   readonly property bool configured: profile !== null && npub !== ""
@@ -170,6 +181,7 @@ Item {
     remote: root.remoteSigner,
     publishedNostr: root.publishedNostr,
     publishedListenBrainz: root.publishedListenBrainz,
+    publishedLastFm: root.publishedLastFm,
     lastError: root.lastError
   })
   readonly property string statusText: Model.statusText(publishState)
@@ -178,7 +190,7 @@ Item {
   // ------------------------------------------------------------ publishing
 
   function shouldPublish() {
-    return publishingEnabled && configured && hasTrack && playing && (publishNostr || publishListenBrainz)
+    return publishingEnabled && configured && hasTrack && playing && (publishNostr || publishListenBrainz || publishLastFm)
   }
 
   function publishNowPlaying() {
@@ -194,14 +206,16 @@ Item {
       "--album", album,
       "--duration-ms", String(durationMs)
     ].concat(publishNostr ? [] : ["--no-nostr"])
-     .concat(publishListenBrainz ? [] : ["--no-listenbrainz"]))
+     .concat(publishListenBrainz ? [] : ["--no-listenbrainz"])
+     .concat(publishLastFm ? [] : ["--no-lastfm"]))
     nowPlayingProcess.running = true
   }
 
-  // ListenBrainz wants a second submission once the track has genuinely been
-  // listened to; Nostr has no equivalent, so this is ListenBrainz-only.
+  // ListenBrainz and Last.fm want a second submission once the track has
+  // genuinely been listened to; Nostr has no equivalent.
   function maybeSubmitListen() {
-    if (!publishingEnabled || !publishListenBrainz || !configured) return
+    if (!publishingEnabled || !configured) return
+    if (!publishListenBrainz && !publishLastFm) return
     if (signature === "" || signature === listenedSignature) return
     if (signature !== publishedSignature) return
     if (listenProcess.running) return
@@ -224,6 +238,7 @@ Item {
     listenedSignature = ""
     publishedNostr = false
     publishedListenBrainz = false
+    publishedLastFm = false
     if (!publishNostr) return
     clearProcess.command = helperCommand(["clear"])
     clearProcess.running = true
@@ -292,6 +307,55 @@ Item {
       if (shouldPublish()) settleTimer.restart()
     } else {
       lbLoginError = briefly(parsed.error || "ListenBrainz sign-in failed")
+    }
+  }
+
+  // ----------------------------------------------------------- last.fm login
+
+  function startLastFmLogin() {
+    if (lfLoginActive || lfLoginProcess.running) return
+    lfLoginUrl = ""
+    lfLoginOpened = false
+    lfLoginError = ""
+    lfLoginActive = true
+    lfLoginProcess.command = helperCommand(["lastfm-login"])
+    lfLoginProcess.running = true
+  }
+
+  function cancelLastFmLogin() {
+    if (lfLoginProcess.running) lfLoginProcess.running = false
+    lfLoginActive = false
+    lfLoginUrl = ""
+  }
+
+  function lastfmLogout() {
+    if (lfLogoutProcess.running) return
+    cancelLastFmLogin()
+    lfLogoutProcess.command = helperCommand(["lastfm-logout"])
+    lfLogoutProcess.running = true
+  }
+
+  function handleLastFmLoginLine(line) {
+    var parsed = parseResult(line)
+    if (!parsed) return
+
+    if (parsed.stage === "auth") {
+      lfLoginUrl = String(parsed.url || "")
+      lfLoginOpened = parsed.opened === true
+      lfLoginError = ""
+      return
+    }
+
+    if (parsed.stage !== "done") return
+    lfLoginActive = false
+    lfLoginUrl = ""
+    if (parsed.ok) {
+      lfLoginError = ""
+      publishedSignature = ""
+      refreshState()
+      if (shouldPublish()) settleTimer.restart()
+    } else {
+      lfLoginError = briefly(parsed.error || "Last.fm sign-in failed")
     }
   }
 
@@ -375,6 +439,7 @@ Item {
     playedMs = 0
     publishedNostr = false
     publishedListenBrainz = false
+    publishedLastFm = false
     if (signature === "" || signature !== publishedSignature) {
       publishedSignature = ""
       listenedSignature = ""
@@ -465,6 +530,7 @@ Item {
       root.publishedSignature = pendingSignature
       root.publishedNostr = !!(result.nostr && result.nostr.ok)
       root.publishedListenBrainz = !!(result.listenbrainz && result.listenbrainz.ok)
+      root.publishedLastFm = !!(result.lastfm && result.lastfm.ok)
       // A track long past its listen threshold when it was published — a
       // resumed track, or a slow relay — should still be submitted.
       root.maybeSubmitListen()
@@ -505,6 +571,10 @@ Item {
         root.listenbrainzMode = String(result.listenbrainz.mode || "none")
         root.listenbrainzUser = String(result.listenbrainz.username || "")
       }
+      if (result.lastfm) {
+        root.lastfmMode = String(result.lastfm.mode || "none")
+        root.lastfmUser = String(result.lastfm.username || "")
+      }
     }
   }
 
@@ -529,6 +599,31 @@ Item {
       root.listenbrainzMode = "none"
       root.listenbrainzUser = ""
       root.publishedListenBrainz = false
+      root.refreshState()
+    }
+  }
+
+  Process {
+    id: lfLoginProcess
+    running: false
+    command: []
+    stdout: SplitParser { onRead: function(line) { root.handleLastFmLoginLine(line) } }
+    stderr: SplitParser { onRead: function(line) { root.lfLoginError = root.briefly(line) } }
+    onExited: function(exitCode) {
+      root.lfLoginActive = false
+      root.lfLoginUrl = ""
+    }
+  }
+
+  Process {
+    id: lfLogoutProcess
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.lastfmMode = "none"
+      root.lastfmUser = ""
+      root.publishedLastFm = false
       root.refreshState()
     }
   }
@@ -612,6 +707,8 @@ Item {
         mode: root.signingMode,
         listenbrainz: root.listenbrainzMode,
         listenbrainzUser: root.listenbrainzUser,
+        lastfm: root.lastfmMode,
+        lastfmUser: root.lastfmUser,
         npub: root.npub,
         player: root.playerName,
         artist: root.artist,
@@ -620,6 +717,7 @@ Item {
         playing: root.playing,
         publishedNostr: root.publishedNostr,
         publishedListenBrainz: root.publishedListenBrainz,
+        publishedLastFm: root.publishedLastFm,
         text: root.statusText
       })
     }
@@ -662,6 +760,16 @@ Item {
 
     function listenbrainzLogout(): string {
       root.listenbrainzLogout()
+      return "ok"
+    }
+
+    function lastfmLogin(): string {
+      root.startLastFmLogin()
+      return "ok"
+    }
+
+    function lastfmLogout(): string {
+      root.lastfmLogout()
       return "ok"
     }
   }

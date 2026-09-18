@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.0
+
+Add Last.fm scrobbling alongside Nostr and ListenBrainz.
+
+- Connect Last.fm from the bar card through the official desktop approval flow
+- Publish now-playing updates and completed listens with signed API requests
+- Store the Last.fm session using the same bounded, no-follow private-file
+  handling as the Nostr and ListenBrainz sessions
+- Restrict Last.fm credential-bearing requests to the official HTTPS API origin
+- Add local stub-server coverage for authentication, signatures, submissions,
+  and session handling
+
 ## 1.2.3
 
 Address the second round of marketplace security review (submission #6347).

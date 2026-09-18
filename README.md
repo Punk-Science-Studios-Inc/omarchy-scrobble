@@ -118,6 +118,28 @@ here. Listens submitted this way land in exactly the same place as native ones.
 **Disconnect ListenBrainz** in the card forgets the session, which is stored at
 `~/.local/share/omarchy-scrobble/listenbrainz.json` (mode 0600).
 
+## Connect Last.fm
+
+Last.fm needs an API key and shared secret from a registered Last.fm app. Add
+both to `~/.config/omarchy-scrobble/config.json`:
+
+```json
+{
+  "lastfmApiKey": "your-api-key",
+  "lastfmApiSecret": "your-api-secret"
+}
+```
+
+Then click **Connect Last.fm** in the card. The helper opens Last.fm's approval
+page; sign in and press **Yes, allow access**. The card polls for approval and
+stores the resulting session at `~/.local/share/omarchy-scrobble/lastfm.json`
+(mode 0600). It stores the session key, not your Last.fm password. **Disconnect
+Last.fm** removes the session.
+
+Last.fm credentials are sent only to the official HTTPS API origin
+(`ws.audioscrobbler.com`). The API key and secret are required for the signed
+desktop login flow; do not commit them or paste them into issue reports.
+
 If you would rather paste a token, put one in the config file as
 `listenbrainzToken` — it takes precedence over a session, and uses the native
 API instead.
@@ -154,6 +176,8 @@ to every relay, and validates the ListenBrainz token.
 | `listenbrainzToken` | A pasted token from <https://listenbrainz.org/settings/>, instead of signing in. Takes precedence over a session |
 | `listenbrainzUrl` | For a self-hosted ListenBrainz native API |
 | `listenbrainzCompatUrl` | For a self-hosted ListenBrainz Last.fm-compatible API |
+| `lastfmApiKey` | API key from a registered Last.fm app |
+| `lastfmApiSecret` | Shared secret from that Last.fm app; keep the config mode 0600 |
 | `nsec` | A local secret key, if you would rather not use a phone. See below |
 | `nsecCommand` | A shell command that prints that key instead, e.g. `pass show nostr/nsec` |
 

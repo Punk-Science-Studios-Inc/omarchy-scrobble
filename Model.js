@@ -136,6 +136,7 @@ function statusText(state) {
   var targets = []
   if (state.publishedNostr) targets.push("Nostr")
   if (state.publishedListenBrainz) targets.push("ListenBrainz")
+  if (state.publishedLastFm) targets.push("Last.fm")
   if (targets.length === 0) return "Not published"
   return "Published to " + targets.join(" · ")
 }

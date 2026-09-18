@@ -3,7 +3,7 @@
 
 The QML side of the plugin watches MPRIS and decides *when* something should
 be published. This helper does the parts QML cannot: BIP-340 Schnorr signing,
-speaking WebSocket to Nostr relays, and talking HTTP to ListenBrainz.
+speaking WebSocket to Nostr relays, and talking HTTP to ListenBrainz and Last.fm.
 
 Every subcommand prints a single JSON object on stdout and exits 0 unless the
 process itself failed, so the caller can parse one line and never has to read
@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.2.3"
+VERSION = "1.3.0"
 USER_AGENT = f"omarchy-scrobble/{VERSION}"
 
 DEFAULT_RELAYS = [
@@ -44,6 +44,9 @@ DEFAULT_RELAYS = [
     "wss://relay.primal.net",
 ]
 DEFAULT_LISTENBRAINZ_URL = "https://api.listenbrainz.org"
+LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+LASTFM_AUTH_URL = "https://www.last.fm/api/auth/"
+LASTFM_HOSTS = frozenset(("ws.audioscrobbler.com",))
 
 KIND_METADATA = 0
 KIND_USER_STATUS = 30315  # NIP-38
@@ -1113,7 +1116,12 @@ class ConfigError(PrivateFileError):
     pass
 
 
-SECRET_CONFIG_KEYS = ("nsec", "listenbrainzToken")
+SECRET_CONFIG_KEYS = (
+    "nsec",
+    "listenbrainzToken",
+    "lastfmApiKey",
+    "lastfmApiSecret",
+)
 
 
 def read_config(path: str) -> dict:
@@ -1501,6 +1509,217 @@ def listenbrainz_submit_compat(session: dict, config: dict, entries: list, now_p
     except ListenBrainzError as error:
         return {"ok": False, "detail": str(error), "via": "session"}
     return {"ok": True, "via": "session"}
+
+
+# --------------------------------------------------------------- last.fm
+#
+# Last.fm uses a registered-app model: every request needs an api_key and
+# an api_sig (MD5 of sorted params + api_secret). The desktop auth flow is
+# identical to the Last.fm-compat flow ListenBrainz already uses, but with
+# a real signature check on the server side.
+
+
+class LastFmError(Exception):
+    pass
+
+
+def lastfm_api_sig(params: dict, api_secret: str) -> str:
+    """Build a Last.fm API signature: sorted key-value pairs + secret, MD5."""
+    pairs = []
+    for key in sorted(params):
+        if key in ("format", "callback"):
+            continue
+        pairs.append(f"{key}{params[key]}")
+    return hashlib.md5("".join(pairs).encode() + api_secret.encode()).hexdigest()
+
+
+def lastfm_session_path() -> str:
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(data_home, "omarchy-scrobble", "lastfm.json")
+
+
+def load_lastfm_session():
+    try:
+        session, _ = _read_json_descriptor(lastfm_session_path())
+    except (OSError, PrivateFileError):
+        return None
+    return session if isinstance(session, dict) and session.get("sessionKey") else None
+
+
+def save_lastfm_session(session: dict):
+    _write_private_json(lastfm_session_path(), session)
+
+
+def delete_lastfm_session():
+    try:
+        os.remove(lastfm_session_path())
+        return True
+    except OSError:
+        return False
+
+
+def trusted_lastfm_url(value: str = None) -> str:
+    """Allow Last.fm credentials only to the official API origin."""
+    raw = str(value or LASTFM_API_URL).strip()
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        hostname = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        raise LastFmError("Last.fm URL is malformed") from None
+    if (
+        parts.scheme != "https"
+        or hostname not in LASTFM_HOSTS
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or (port is not None and port != 443)
+    ):
+        raise LastFmError("Last.fm URL must be the official HTTPS API origin")
+    return raw
+
+
+def lastfm_mode(config: dict) -> str:
+    key = str(config.get("lastfmApiKey") or "").strip()
+    secret = str(config.get("lastfmApiSecret") or "").strip()
+    if key and secret and load_lastfm_session():
+        return "session"
+    return "none"
+
+
+def lastfm_call(url: str, params: dict, api_secret: str, method: str = "GET", timeout: float = 15.0):
+    """One signed Last.fm API call, returning parsed JSON."""
+    params = {k: v for k, v in params.items()}
+    params["api_sig"] = lastfm_api_sig(params, api_secret)
+    params["format"] = "json"
+    encoded = urllib.parse.urlencode(params)
+    if method == "POST":
+        request = urllib.request.Request(
+            url,
+            data=encoded.encode(),
+            method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": USER_AGENT,
+            },
+        )
+    else:
+        request = urllib.request.Request(
+            f"{url}?{encoded}", headers={"User-Agent": USER_AGENT}
+        )
+
+    def _read_body(src):
+        data = src.read(MAX_HTTP_RESPONSE_BYTES + 1)
+        if len(data) > MAX_HTTP_RESPONSE_BYTES:
+            raise LastFmError(f"response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes")
+        return data.decode("utf-8", "replace")
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = _read_body(response)
+    except urllib.error.HTTPError as error:
+        body = _read_body(error)
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            raise LastFmError(f"HTTP {error.code}: {body[:200]}") from None
+        raise LastFmError(
+            str(parsed.get("message") or parsed.get("error") or f"HTTP {error.code}")
+        ) from None
+    except (urllib.error.URLError, OSError) as error:
+        raise LastFmError(str(error)) from None
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        raise LastFmError(f"unexpected response: {body[:200]}") from None
+
+
+def lastfm_request_token(config: dict, api_key: str, api_secret: str, timeout: float) -> str:
+    result = lastfm_call(
+        trusted_lastfm_url(config.get("lastfmUrl")),
+        {"method": "auth.getToken", "api_key": api_key},
+        api_secret,
+        timeout=timeout,
+    )
+    token = result.get("token")
+    if not token:
+        raise LastFmError(f"no token in response: {str(result)[:200]}")
+    return str(token)
+
+
+def lastfm_fetch_session(config: dict, api_key: str, api_secret: str, token: str, timeout: float):
+    """None while the user has not approved yet; the session once they have."""
+    try:
+        result = lastfm_call(
+            trusted_lastfm_url(config.get("lastfmUrl")),
+            {"method": "auth.getSession", "api_key": api_key, "token": token},
+            api_secret,
+            timeout=timeout,
+        )
+    except LastFmError as error:
+        message = str(error).lower()
+        if "unauthorized" in message or "not been authorized" in message:
+            return None
+        if "expired" in message:
+            raise
+        return None
+
+    session = result.get("session") or {}
+    key = session.get("key")
+    if not key:
+        return None
+    return {"sessionKey": str(key), "username": str(session.get("name") or ""), "apiKey": api_key, "apiSecret": api_secret}
+
+
+def lastfm_submit(session: dict, config: dict, entries: list, now_playing: bool,
+                  timeout: float = 10.0) -> dict:
+    """Submit through the real Last.fm API using a signed session."""
+    method = "track.updateNowPlaying" if now_playing else "track.scrobble"
+    params = {
+        "method": method,
+        "api_key": session["apiKey"],
+        "sk": session["sessionKey"],
+    }
+    for index, entry in enumerate(entries):
+        params[f"artist[{index}]"] = entry["artist"]
+        params[f"track[{index}]"] = entry["title"]
+        if entry.get("album"):
+            params[f"album[{index}]"] = entry["album"]
+        if entry.get("duration"):
+            params[f"duration[{index}]"] = str(int(entry["duration"]))
+        if not now_playing:
+            params[f"timestamp[{index}]"] = str(int(entry["listened_at"]))
+
+    try:
+        lastfm_call(
+            trusted_lastfm_url(config.get("lastfmUrl")),
+            params,
+            session["apiSecret"],
+            method="POST",
+            timeout=timeout,
+        )
+    except LastFmError as error:
+        return {"ok": False, "detail": str(error), "via": "session"}
+    return {"ok": True, "via": "session"}
+
+
+def lastfm_send(config, artist, title, album, duration_ms, now_playing,
+                listened_at=None, timeout=10.0) -> dict:
+    """Submit a now-playing or a listen to Last.fm."""
+    if lastfm_mode(config) == "none":
+        return {"ok": False, "skipped": True, "detail": "Last.fm is not connected"}
+
+    session = load_lastfm_session()
+    entry = {
+        "artist": artist,
+        "title": title,
+        "album": album,
+        "duration": duration_ms // 1000 if duration_ms > 0 else 0,
+        "listened_at": int(listened_at if listened_at is not None else time.time()),
+    }
+    return lastfm_submit(session, config, [entry], now_playing, timeout=timeout)
 
 
 # ------------------------------------------------------------------ profile
@@ -2114,19 +2333,30 @@ def cmd_now_playing(args, config) -> int:
     else:
         result["listenbrainz"] = {"ok": False, "skipped": True}
 
-    result["ok"] = bool(result["nostr"].get("ok") or result["listenbrainz"].get("ok"))
+    if not args.no_lastfm:
+        result["lastfm"] = lastfm_send(
+            config, artist, title, album, args.duration_ms, True, timeout=args.timeout
+        )
+    else:
+        result["lastfm"] = {"ok": False, "skipped": True}
+
+    result["ok"] = bool(
+        result["nostr"].get("ok")
+        or result["listenbrainz"].get("ok")
+        or result["lastfm"].get("ok")
+    )
     return emit(result)
 
 
 def cmd_listen(args, config) -> int:
-    """Submit the completed play to ListenBrainz. Nostr has no equivalent —
-    NIP-38 is a live status, not a history — so this is ListenBrainz only."""
+    """Submit the completed play to ListenBrainz and Last.fm. Nostr has no
+    equivalent — NIP-38 is a live status, not a history."""
     artist = args.artist.strip()
     title = args.title.strip()
     if not artist or not title:
         return emit({"ok": False, "error": "a listen needs both an artist and a title"})
 
-    outcome = listenbrainz_send(
+    outcome_lb = listenbrainz_send(
         config,
         artist,
         title,
@@ -2136,7 +2366,18 @@ def cmd_listen(args, config) -> int:
         listened_at=args.listened_at or None,
         timeout=args.timeout,
     )
-    return emit({"ok": outcome.get("ok", False), "listenbrainz": outcome})
+    outcome_lf = lastfm_send(
+        config,
+        artist,
+        title,
+        (args.album or "").strip(),
+        args.duration_ms,
+        False,
+        listened_at=args.listened_at or None,
+        timeout=args.timeout,
+    )
+    ok = bool(outcome_lb.get("ok") or outcome_lf.get("ok"))
+    return emit({"ok": ok, "listenbrainz": outcome_lb, "lastfm": outcome_lf})
 
 
 def cmd_clear(args, config) -> int:
@@ -2320,6 +2561,62 @@ def cmd_listenbrainz_logout(args, config) -> int:
     return emit({"ok": delete_listenbrainz_session(), "mode": listenbrainz_mode(config)})
 
 
+def cmd_lastfm_login(args, config) -> int:
+    """Sign in to Last.fm through its web approval page.
+
+    Streams one JSON object per line: the approval URL first, so the
+    interface can show it while the browser opens, then the result.
+    """
+    api_key = str(config.get("lastfmApiKey") or "").strip()
+    api_secret = str(config.get("lastfmApiSecret") or "").strip()
+    if not api_key or not api_secret:
+        return emit({
+            "stage": "done",
+            "ok": False,
+            "error": "lastfmApiKey and lastfmApiSecret must be set in config.json",
+        })
+
+    try:
+        token = lastfm_request_token(config, api_key, api_secret, args.timeout)
+    except LastFmError as error:
+        return emit({"stage": "done", "ok": False, "error": str(error)})
+
+    approve_url = f"{LASTFM_AUTH_URL}?api_key={urllib.parse.quote(api_key)}&token={urllib.parse.quote(token)}"
+    opened = False if args.no_browser else open_in_browser(approve_url)
+    emit({
+        "stage": "auth",
+        "url": approve_url,
+        "opened": opened,
+        "expiresIn": int(args.wait),
+    })
+
+    deadline = time.monotonic() + args.wait
+    while time.monotonic() < deadline:
+        time.sleep(args.poll)
+        try:
+            session = lastfm_fetch_session(config, api_key, api_secret, token, args.timeout)
+        except LastFmError as error:
+            return emit({"stage": "done", "ok": False, "error": str(error)})
+        if session:
+            save_lastfm_session(session)
+            return emit({
+                "stage": "done",
+                "ok": True,
+                "mode": "session",
+                "username": session["username"],
+            })
+
+    return emit({
+        "stage": "done",
+        "ok": False,
+        "error": "timed out waiting for approval in the browser",
+    })
+
+
+def cmd_lastfm_logout(args, config) -> int:
+    return emit({"ok": delete_lastfm_session(), "mode": lastfm_mode(config)})
+
+
 def cmd_state(args, config) -> int:
     """Everything the interface needs to render, with no network calls."""
     mode = signing_mode(config)
@@ -2331,12 +2628,17 @@ def cmd_state(args, config) -> int:
             mode = "none"
 
     listenbrainz = load_listenbrainz_session() or {}
+    lastfm = load_lastfm_session() or {}
     return emit({
         "ok": True,
         "signing": {"mode": mode, "npub": npub},
         "listenbrainz": {
             "mode": listenbrainz_mode(config),
             "username": str(listenbrainz.get("username") or ""),
+        },
+        "lastfm": {
+            "mode": lastfm_mode(config),
+            "username": str(lastfm.get("username") or ""),
         },
     })
 
@@ -2407,14 +2709,23 @@ def cmd_doctor(args, config) -> int:
         except (urllib.error.URLError, OSError, ValueError) as error:
             listenbrainz_ok = check("listenbrainz", False, error)
 
-    report["ok"] = bool(signing_ok and reachable and listenbrainz_ok is not False)
+    lf_mode = lastfm_mode(config)
+    report["lastfmMode"] = lf_mode
+    if lf_mode == "session":
+        stored_lf = load_lastfm_session() or {}
+        lastfm_ok = check("last.fm (signed in)", True, stored_lf.get("username", ""))
+    else:
+        check("last.fm", False, "not connected — add lastfmApiKey and lastfmApiSecret to config, then run `lastfm-login`")
+        lastfm_ok = None
+
+    report["ok"] = bool(signing_ok and reachable and listenbrainz_ok is not False and lastfm_ok is not False)
     return emit(report)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="omarchy-scrobble",
-        description="Publish now-playing music to Nostr (NIP-38) and ListenBrainz.",
+        description="Publish now-playing music to Nostr (NIP-38), ListenBrainz and Last.fm.",
     )
     parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--config", default=config_path(), help="path to config.json")
@@ -2430,7 +2741,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile.set_defaults(handler=cmd_profile)
 
     now_playing = subparsers.add_parser(
-        "now-playing", help="publish a NIP-38 status and a ListenBrainz playing-now"
+        "now-playing", help="publish a NIP-38 status and playing-now to ListenBrainz and Last.fm"
     )
     now_playing.add_argument("--artist", required=True)
     now_playing.add_argument("--title", required=True)
@@ -2438,9 +2749,10 @@ def build_parser() -> argparse.ArgumentParser:
     now_playing.add_argument("--duration-ms", type=int, default=0, dest="duration_ms")
     now_playing.add_argument("--no-nostr", action="store_true")
     now_playing.add_argument("--no-listenbrainz", action="store_true")
+    now_playing.add_argument("--no-lastfm", action="store_true")
     now_playing.set_defaults(handler=cmd_now_playing)
 
-    listen = subparsers.add_parser("listen", help="submit a completed listen to ListenBrainz")
+    listen = subparsers.add_parser("listen", help="submit a completed listen to ListenBrainz and Last.fm")
     listen.add_argument("--artist", required=True)
     listen.add_argument("--title", required=True)
     listen.add_argument("--album", default="")
@@ -2482,7 +2794,20 @@ def build_parser() -> argparse.ArgumentParser:
     lb_logout = subparsers.add_parser("listenbrainz-logout", help="forget the ListenBrainz session")
     lb_logout.set_defaults(handler=cmd_listenbrainz_logout)
 
-    state = subparsers.add_parser("state", help="print signing and ListenBrainz status, offline")
+    lf_login = subparsers.add_parser(
+        "lastfm-login", help="sign in to Last.fm via its web approval page"
+    )
+    lf_login.add_argument("--no-browser", action="store_true", help="print the URL, do not open it")
+    lf_login.add_argument(
+        "--wait", type=float, default=300.0, help="seconds to wait for approval"
+    )
+    lf_login.add_argument("--poll", type=float, default=3.0, help="seconds between checks")
+    lf_login.set_defaults(handler=cmd_lastfm_login)
+
+    lf_logout = subparsers.add_parser("lastfm-logout", help="forget the Last.fm session")
+    lf_logout.set_defaults(handler=cmd_lastfm_logout)
+
+    state = subparsers.add_parser("state", help="print signing, ListenBrainz and Last.fm status, offline")
     state.set_defaults(handler=cmd_state)
 
     doctor = subparsers.add_parser("doctor", help="check config, relays and tokens")

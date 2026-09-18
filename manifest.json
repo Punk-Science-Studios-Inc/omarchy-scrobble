@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.punkscience.omarchy-scrobble",
   "name": "Scrobble",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "author": "Darryl G. Wright",
   "license": "Unlicense",
-  "description": "Publish the currently playing track to your Nostr status (NIP-38) and to ListenBrainz.",
+  "description": "Publish the currently playing track to your Nostr status (NIP-38), ListenBrainz and Last.fm.",
   "kinds": [
     "service",
     "bar-widget"
@@ -17,12 +17,13 @@
   },
   "barWidget": {
     "displayName": "Scrobble",
-    "description": "Now playing, published to Nostr and ListenBrainz. Hover for your identity and the current track.",
+    "description": "Now playing, published to Nostr, ListenBrainz and Last.fm. Hover for your identity and the current track.",
     "category": "Media",
     "aliases": [
       "scrobble",
       "nostr",
       "listenbrainz",
+      "lastfm",
       "music",
       "now playing"
     ],
@@ -32,6 +33,7 @@
       "enabled": true,
       "publishNostr": true,
       "publishListenBrainz": true,
+      "publishLastFm": true,
       "playerFilter": "",
       "settleSeconds": 5
     },
@@ -55,6 +57,13 @@
         "type": "boolean",
         "label": "Publish to ListenBrainz",
         "description": "Send a now-playing, then a listen once the track has played long enough.",
+        "defaultValue": true
+      },
+      {
+        "key": "publishLastFm",
+        "type": "boolean",
+        "label": "Publish to Last.fm",
+        "description": "Send a now-playing, then a scrobble once the track has played long enough.",
         "defaultValue": true
       },
       {
