@@ -19,6 +19,8 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
+import ipaddress
 import json
 import os
 import socket
@@ -33,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 USER_AGENT = f"omarchy-scrobble/{VERSION}"
 
 DEFAULT_RELAYS = [
@@ -48,8 +50,10 @@ KIND_USER_STATUS = 30315  # NIP-38
 STATUS_D_TAG = "music"
 
 MAX_AVATAR_BYTES = 4 * 1024 * 1024
+MAX_AVATAR_REDIRECTS = 5
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024        # 1 MiB cap on any HTTP response we parse
 MAX_WS_PAYLOAD_BYTES = 256 * 1024             # 256 KiB cap on any WebSocket frame payload
+MAX_WS_HANDSHAKE_BYTES = 16 * 1024            # 16 KiB cap on relay handshake headers
 MAX_PRIVATE_JSON_BYTES = 128 * 1024
 PRIVATE_FILE_MODE = 0o600
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -352,7 +356,7 @@ def schnorr_sign(msg: bytes, seckey: bytes, aux_rand: bytes) -> bytes:
 
 
 def schnorr_verify(msg: bytes, pubkey: bytes, sig: bytes) -> bool:
-    """Only used by the test suite, but it lives next to the signer on purpose."""
+    """Authenticate a Schnorr signature; used by tests and by event validation."""
     if len(msg) != 32 or len(pubkey) != 32 or len(sig) != 64:
         return False
     point = lift_x(int.from_bytes(pubkey, "big"))
@@ -800,10 +804,19 @@ class WebSocket:
         head, self._buffer = self._buffer[:count], self._buffer[count:]
         return head
 
-    def _read_until(self, marker: bytes) -> bytes:
+    def _read_until(self, marker: bytes, limit: int = MAX_WS_HANDSHAKE_BYTES) -> bytes:
+        """Read through `marker`, refusing to buffer more than `limit` bytes.
+
+        The handshake is the one place a peer controls how much we read before
+        any frame-size limit applies, so it gets its own ceiling.
+        """
         while marker not in self._buffer:
+            if len(self._buffer) > limit:
+                raise WebSocketError(f"handshake headers exceed {limit} bytes")
             self._fill()
         index = self._buffer.index(marker) + len(marker)
+        if index > limit:
+            raise WebSocketError(f"handshake headers exceed {limit} bytes")
         head, self._buffer = self._buffer[:index], self._buffer[index:]
         return head
 
@@ -934,6 +947,81 @@ def build_event(seckey: bytes, kind: int, tags, content: str, created_at=None) -
     }
 
 
+def event_matches_filters(event: dict, filters: dict) -> bool:
+    """NIP-01 filter match for a already-authenticated event."""
+    if "ids" in filters and event["id"] not in filters["ids"]:
+        return False
+    if "authors" in filters and event["pubkey"] not in filters["authors"]:
+        return False
+    if "kinds" in filters and event["kind"] not in filters["kinds"]:
+        return False
+    for key, wanted in filters.items():
+        if not key.startswith("#") or len(key) != 2 or not isinstance(wanted, (list, tuple)):
+            continue
+        letter = key[1]
+        values = [
+            tag[1]
+            for tag in event["tags"]
+            if isinstance(tag, list) and len(tag) >= 2 and tag[0] == letter
+        ]
+        if not any(value in wanted for value in values):
+            return False
+    if "since" in filters and event["created_at"] < filters["since"]:
+        return False
+    if "until" in filters and event["created_at"] > filters["until"]:
+        return False
+    return True
+
+
+def verify_event(event, filters: dict = None) -> bool:
+    """Authenticate a relay-supplied event before it is trusted.
+
+    Recomputes the NIP-01 id from the canonical serialization and checks the
+    BIP-340 signature, so a relay cannot invent or alter an event. When a
+    filter is supplied the event must also match it, which is what stops a
+    validly signed event from a *different* key standing in for the author a
+    query asked about. Anything malformed is rejected, never raised.
+    """
+    try:
+        if not isinstance(event, dict):
+            return False
+        event_id = event.get("id")
+        pubkey = event.get("pubkey")
+        signature = event.get("sig")
+        created_at = event.get("created_at")
+        kind = event.get("kind")
+        tags = event.get("tags")
+        content = event.get("content")
+        if not isinstance(event_id, str) or len(event_id) != 64:
+            return False
+        if not isinstance(pubkey, str) or len(pubkey) != 64:
+            return False
+        if not isinstance(signature, str) or len(signature) != 128:
+            return False
+        if not isinstance(created_at, int) or isinstance(created_at, bool):
+            return False
+        if not isinstance(kind, int) or isinstance(kind, bool):
+            return False
+        if not isinstance(tags, list) or not all(isinstance(tag, list) for tag in tags):
+            return False
+        if not isinstance(content, str):
+            return False
+        expected = hashlib.sha256(
+            serialize_event(pubkey, created_at, kind, tags, content)
+        ).hexdigest()
+        if not hmac.compare_digest(expected, event_id.lower()):
+            return False
+        if not schnorr_verify(
+            bytes.fromhex(event_id), bytes.fromhex(pubkey), bytes.fromhex(signature)
+        ):
+            return False
+        if filters is not None and not event_matches_filters(event, filters):
+            return False
+        return True
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
 def publish_to_relay(url: str, event: dict, timeout: float) -> dict:
     try:
         with WebSocket(url, timeout) as ws:
@@ -991,7 +1079,8 @@ def query_relay(url: str, filters: dict, timeout: float) -> list:
                 if not isinstance(message, list) or len(message) < 2:
                     continue
                 if message[0] == "EVENT" and message[1] == subscription and len(message) >= 3:
-                    events.append(message[2])
+                    if verify_event(message[2], filters):
+                        events.append(message[2])
                 elif message[0] in ("EOSE", "CLOSED") and message[1] == subscription:
                     break
     except (WebSocketError, OSError, ssl.SSLError):
@@ -1417,13 +1506,108 @@ def listenbrainz_submit_compat(session: dict, config: dict, entries: list, now_p
 # ------------------------------------------------------------------ profile
 
 
+def _is_public_ip(address: str) -> bool:
+    try:
+        return ipaddress.ip_address(address).is_global
+    except ValueError:
+        return False
+
+
+def validate_avatar_url(url: str) -> str:
+    """Return the public address a profile picture may be fetched from.
+
+    Only HTTPS on the default port, with no embedded credentials, and only if
+    every address the host resolves to is globally routable. That last check
+    is what keeps a relay-supplied profile from aiming the fetch at loopback,
+    link-local, or private services (SSRF). Callers connect to the returned
+    address directly, so a later DNS change cannot redirect the request.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError("avatar url must be https")
+    if not parts.hostname:
+        raise ValueError("avatar url has no host")
+    if parts.username or parts.password:
+        raise ValueError("avatar url must not carry credentials")
+    if parts.port not in (None, 443):
+        raise ValueError("avatar url must use the default HTTPS port")
+    try:
+        infos = socket.getaddrinfo(parts.hostname, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        raise ValueError(f"avatar host does not resolve: {parts.hostname}") from error
+    addresses = []
+    for info in infos:
+        address = info[4][0]
+        if not _is_public_ip(address):
+            raise ValueError("avatar host resolves to a non-public address")
+        addresses.append(address)
+    if not addresses:
+        raise ValueError("avatar host does not resolve")
+    return next((address for address in addresses if ":" not in address), addresses[0])
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse automatic redirects; download_avatar validates each hop itself."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _pinned_connection_class(address: str):
+    """An HTTPS connection that dials `address`, whatever host is requested.
+
+    TLS still verifies against the original hostname, but the TCP connection
+    goes to the address we already checked, closing the DNS-rebinding window
+    between validation and connect.
+    """
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, host, **kwargs):
+            super().__init__(host, **kwargs)
+            self._create_connection = (
+                lambda target, *args, **kw: socket.create_connection(
+                    (address, self.port), *args, **kw
+                )
+            )
+
+    return _PinnedHTTPSConnection
+
+
+def _avatar_opener(address: str):
+    pinned = _pinned_connection_class(address)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(pinned, req, context=self._context)
+
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+        _PinnedHTTPSHandler(),
+    )
+
+
 def download_avatar(url: str) -> str:
     """Cache the profile picture locally so QML can point an Image at a file."""
-    if not url.startswith(("http://", "https://")):
-        raise ValueError("avatar url must be http(s)")
+    current = url
+    response = None
+    for _ in range(MAX_AVATAR_REDIRECTS + 1):
+        address = validate_avatar_url(current)
+        request = urllib.request.Request(current, headers={"User-Agent": USER_AGENT})
+        try:
+            response = _avatar_opener(address).open(request, timeout=10)
+            break
+        except urllib.error.HTTPError as error:
+            code = error.code
+            location = error.headers.get("Location") if error.headers else None
+            error.close()
+            if code not in (301, 302, 303, 307, 308) or not location:
+                raise
+            current = urllib.parse.urljoin(current, location)
+    else:
+        raise ValueError("too many avatar redirects")
 
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with response:
         content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
         blob = response.read(MAX_AVATAR_BYTES + 1)
     if len(blob) > MAX_AVATAR_BYTES:
@@ -1436,10 +1620,10 @@ def download_avatar(url: str) -> str:
         "image/webp": ".webp",
         "image/gif": ".gif",
         "image/svg+xml": ".svg",
-    }.get(content_type, os.path.splitext(urllib.parse.urlsplit(url).path)[1] or ".img")
+    }.get(content_type, os.path.splitext(urllib.parse.urlsplit(current).path)[1] or ".img")
 
     os.makedirs(cache_dir(), exist_ok=True)
-    digest = hashlib.sha256(url.encode()).hexdigest()[:16]
+    digest = hashlib.sha256(current.encode()).hexdigest()[:16]
     path = os.path.join(cache_dir(), f"avatar-{digest}{extension}")
     temporary = path + ".part"
     with open(temporary, "wb") as handle:

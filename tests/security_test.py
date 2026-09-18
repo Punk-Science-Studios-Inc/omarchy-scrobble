@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pins the four marketplace security-review blockers from issue #6347.
+"""Pins the marketplace security-review blockers from issue #6347.
 
 Each block maps to one reviewer finding:
 
@@ -9,6 +9,13 @@ Each block maps to one reviewer finding:
 3. Secret session files are written with randomized exclusive staging and
    fsync, not a predictable ``.part`` path, and read back the same safe way.
 4. Credentials only ever go to a first-party ListenBrainz HTTPS origin.
+5. Relay handshake headers are capped, so a hostile relay cannot exhaust
+   memory before the frame limits apply.
+6. Every relay-supplied event is authenticated (id + Schnorr signature) and
+   matched against the requested filter before it is trusted.
+7. Profile-picture fetches are confined to public HTTPS addresses, pinned
+   across redirects, so a forged profile cannot reach loopback or private
+   services.
 
 POSIX-only assertions (permission bits, symlinks, fifos) are skipped on
 platforms that lack them rather than failing, so the suite is green on the
@@ -20,9 +27,12 @@ Run: python3 tests/security_test.py
 import importlib.util
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
+import threading
+import time
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -237,6 +247,127 @@ check("no Process execs the helper directly through its shebang",
       [line.strip() for line in qml.splitlines() if "[helperPath" in line])
 check("every helper invocation goes through helperCommand",
       qml.count("helperCommand(") >= 10, qml.count("helperCommand("))
+
+
+print("relay handshake cap")
+
+
+def flooding_handshake_relay():
+    """A relay that sends a 101 status then endless header bytes."""
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+
+    def serve():
+        conn, _ = sock.accept()
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+        conn.sendall(
+            b"HTTP/1.1 101 Switching Protocols\r\nX-Filler: "
+            + b"a" * (helper.MAX_WS_HANDSHAKE_BYTES + 4096)
+        )
+        time.sleep(2)
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"ws://127.0.0.1:{port}/"
+
+
+try:
+    with helper.WebSocket(flooding_handshake_relay(), timeout=5):
+        pass
+    check("an oversized relay handshake is refused", False, "no error raised")
+except helper.WebSocketError as error:
+    check("an oversized relay handshake is refused", "handshake" in str(error), error)
+
+
+print("relay event authentication")
+
+NSEC = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5"
+seckey = helper.bech32_to_bytes(NSEC, "nsec")
+author = helper.public_key_from_secret(seckey).hex()
+event = helper.build_event(
+    seckey, helper.KIND_METADATA, [], json.dumps({"name": "Darryl", "picture": "https://8.8.8.8/a.png"})
+)
+matching = {"kinds": [helper.KIND_METADATA], "authors": [author]}
+
+check("a well-formed event with a matching filter verifies", helper.verify_event(event, matching))
+
+tampered = dict(event)
+tampered["content"] = json.dumps({"name": "Attacker", "picture": "https://127.0.0.1/x"})
+check("a tampered event (id no longer matches) is rejected", not helper.verify_event(tampered, matching))
+
+bad_sig = dict(event)
+bad_sig["sig"] = "00" * 64
+check("a tampered signature is rejected", not helper.verify_event(bad_sig, matching))
+
+other = helper.build_event(bytes.fromhex("11" * 32), helper.KIND_METADATA, [], "{}")
+check("a validly signed event from another key fails the author filter",
+      not helper.verify_event(other, matching))
+check("that other event verifies against its own author",
+      helper.verify_event(other, {"authors": [other["pubkey"]]}))
+check("a kind mismatch fails the filter",
+      not helper.verify_event(event, {"kinds": [helper.KIND_USER_STATUS]}))
+check("a malformed event is rejected, not raised",
+      not helper.verify_event(["not", "a", "dict"], matching)
+      and not helper.verify_event({"id": "zz"}, matching))
+
+
+print("avatar fetch confinement")
+
+for label, bad in [
+    ("plain http", "http://8.8.8.8/a.png"),
+    ("loopback v4", "https://127.0.0.1/a.png"),
+    ("loopback v6", "https://[::1]/a.png"),
+    ("private v4", "https://10.0.0.1/a.png"),
+    ("link-local metadata", "https://169.254.169.254/latest/meta-data"),
+    ("unspecified", "https://0.0.0.0/a.png"),
+    ("embedded credentials", "https://user:pass@8.8.8.8/a.png"),
+    ("a non-443 port", "https://8.8.8.8:8443/a.png"),
+]:
+    try:
+        helper.validate_avatar_url(bad)
+        check(f"avatar fetch refuses {label}", False, "no error raised")
+    except ValueError:
+        check(f"avatar fetch refuses {label}", True)
+
+check("a public HTTPS avatar is accepted",
+      helper.validate_avatar_url("https://8.8.8.8/a.png") == "8.8.8.8")
+
+# The connection must dial the validated address, not re-resolve the host and
+# reopen the DNS-rebinding window.
+pinned = helper._pinned_connection_class("203.0.113.7")
+connection = pinned("public.example")
+dialed = {}
+real_create_connection = helper.socket.create_connection
+
+
+def stop_before_tls(target, *args, **kwargs):
+    dialed["target"] = target
+    raise OSError("stop before the TLS handshake")
+
+
+helper.socket.create_connection = stop_before_tls
+try:
+    connection.connect()
+except OSError:
+    pass
+finally:
+    helper.socket.create_connection = real_create_connection
+check("the avatar connection is pinned to the validated address",
+      dialed.get("target") == ("203.0.113.7", 443), dialed)
+
+# A handler that silently follows a redirect would bypass the per-hop check.
+check("automatic redirects are refused",
+      helper._NoRedirectHandler().redirect_request(
+          None, None, 302, "Found", {}, "https://127.0.0.1/"
+      ) is None)
 
 
 print()

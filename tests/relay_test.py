@@ -11,6 +11,7 @@ Run: python3 tests/relay_test.py
 import base64
 import hashlib
 import importlib.util
+import json
 import os
 import socket
 import struct
@@ -141,6 +142,27 @@ try:
     check("oversized websocket frame is rejected", False)
 except helper.WebSocketError as e:
     check("oversized websocket frame is rejected", "exceeds" in str(e).lower(), e)
+
+print("event authentication")
+
+# A relay is untrusted input. It may hand back a validly-shaped event that the
+# author never signed, or one signed by someone else; the client must drop it
+# before anything downstream (like the profile picture fetch) sees it.
+good = helper.build_event(seckey, helper.KIND_METADATA, [], json.dumps({"name": "Ella"}))
+helper.publish([accepting.url], good, timeout=8)
+filters = {"kinds": [helper.KIND_METADATA], "authors": [good["pubkey"]]}
+returned = helper.query([accepting.url], filters, timeout=8)
+check("a valid stored event is returned by query",
+      any(e["id"] == good["id"] for e in returned))
+
+forged = dict(good)
+forged["content"] = json.dumps({"name": "Attacker", "picture": "https://127.0.0.1/x"})
+helper.publish([accepting.url], forged, timeout=8)   # relay stores without verifying
+returned = helper.query([accepting.url], filters, timeout=8)
+check("a forged event is dropped by the client",
+      all(e.get("content") != forged["content"] for e in returned))
+check("the genuine event still comes through",
+      any(e["id"] == good["id"] and e["content"] == good["content"] for e in returned))
 
 print()
 if failures:

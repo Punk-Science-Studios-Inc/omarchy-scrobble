@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.3
+
+Address the second round of marketplace security review (submission #6347).
+
+- Cap relay WebSocket handshake headers (16 KiB) so a hostile relay cannot
+  exhaust memory before the frame limits apply
+- Authenticate every relay-supplied event before use: recompute the NIP-01 id
+  and check the BIP-340 signature, and require it to match the requested
+  filter (author, kind, tags, time range). A forged profile no longer reaches
+  the picture fetch
+- Confine profile-picture fetches to public HTTPS addresses: reject plain
+  HTTP, loops, private/link-local/unspecified addresses, embedded credentials
+  and non-443 ports; validate every redirect hop and pin the connection to the
+  checked address so a later DNS change cannot redirect it
+
 ## 1.2.2
 
 Address the marketplace security review (submission #6347).
