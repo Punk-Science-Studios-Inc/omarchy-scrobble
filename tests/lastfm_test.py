@@ -49,6 +49,12 @@ received = []
 API_KEY = "deadbeefcafe"
 API_SECRET = "shhh-secret"
 
+# The shipped defaults are exercised rather than stubbed away: the helper
+# must make the login flow work with no user-supplied credentials, exactly
+# like ListenBrainz does.
+helper.LASTFM_API_KEY = API_KEY
+helper.LASTFM_SHARED_SECRET = API_SECRET
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -121,7 +127,7 @@ for bad in (
 # Replace the official endpoint at the module boundary so the production URL
 # validator remains strict while all requests stay on this local stub.
 helper.trusted_lastfm_url = lambda value=None: BASE
-CONFIG = {"lastfmApiKey": API_KEY, "lastfmApiSecret": API_SECRET}
+CONFIG = {}
 
 os.environ["XDG_DATA_HOME"] = os.path.join(HERE, "_tmp_lf_state")
 shutil.rmtree(os.environ["XDG_DATA_HOME"], ignore_errors=True)
@@ -129,8 +135,8 @@ shutil.rmtree(os.environ["XDG_DATA_HOME"], ignore_errors=True)
 # ------------------------------------------------------------------- modes
 
 print("auth modes")
-check("no credentials means unconnected", helper.lastfm_mode({}) == "none")
-check("credentials without session means unconnected", helper.lastfm_mode(CONFIG) == "none")
+check("no config needed to be connected", helper.lastfm_mode({}) == "none")
+check("credential helpers expose the shipped pair", helper.lastfm_credentials() == (API_KEY, API_SECRET))
 
 # ----------------------------------------------------------- the sign-in flow
 

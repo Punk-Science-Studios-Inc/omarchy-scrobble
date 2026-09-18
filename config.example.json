@@ -4,7 +4,5 @@
     "wss://nos.lol",
     "wss://relay.primal.net"
   ],
-  "listenbrainzToken": "replace-me",
-  "lastfmApiKey": "your-lastfm-api-key",
-  "lastfmApiSecret": "your-lastfm-api-secret"
+  "listenbrainzToken": "replace-me"
 }

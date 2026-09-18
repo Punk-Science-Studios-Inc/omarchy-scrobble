@@ -47,6 +47,14 @@ DEFAULT_LISTENBRAINZ_URL = "https://api.listenbrainz.org"
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 LASTFM_AUTH_URL = "https://www.last.fm/api/auth/"
 LASTFM_HOSTS = frozenset(("ws.audioscrobbler.com",))
+# Registered-app credentials shipped with the plugin. Last.fm signs the
+# desktop auth flow (auth.getToken/auth.getSession) with the shared secret,
+# so it must live where the login runs. It authorizes this app, not any
+# user: scrobbling needs the per-install session key minted only after the
+# user approves the browser flow. Overridable by the author via environment
+# so a leaked pair can be rotated without forcing a reinstall.
+LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY") or "1cf0564424dd182fe6d592e79f30807c"
+LASTFM_SHARED_SECRET = os.environ.get("LASTFM_API_SECRET") or "5729f5053a257a843d9fb2f83ef22722"
 
 KIND_METADATA = 0
 KIND_USER_STATUS = 30315  # NIP-38
@@ -1119,8 +1127,6 @@ class ConfigError(PrivateFileError):
 SECRET_CONFIG_KEYS = (
     "nsec",
     "listenbrainzToken",
-    "lastfmApiKey",
-    "lastfmApiSecret",
 )
 
 
@@ -1580,10 +1586,17 @@ def trusted_lastfm_url(value: str = None) -> str:
     return raw
 
 
+def lastfm_credentials() -> tuple[str, str]:
+    """The registered-app key and shared secret.
+
+    Shipped defaults, overridable via env so a leaked pair can be rotated
+    without a reinstall. Users never configure these.
+    """
+    return LASTFM_API_KEY, LASTFM_SHARED_SECRET
+
+
 def lastfm_mode(config: dict) -> str:
-    key = str(config.get("lastfmApiKey") or "").strip()
-    secret = str(config.get("lastfmApiSecret") or "").strip()
-    if key and secret and load_lastfm_session():
+    if load_lastfm_session():
         return "session"
     return "none"
 
@@ -2567,13 +2580,12 @@ def cmd_lastfm_login(args, config) -> int:
     Streams one JSON object per line: the approval URL first, so the
     interface can show it while the browser opens, then the result.
     """
-    api_key = str(config.get("lastfmApiKey") or "").strip()
-    api_secret = str(config.get("lastfmApiSecret") or "").strip()
+    api_key, api_secret = lastfm_credentials()
     if not api_key or not api_secret:
         return emit({
             "stage": "done",
             "ok": False,
-            "error": "lastfmApiKey and lastfmApiSecret must be set in config.json",
+            "error": "Last.fm credentials are not configured",
         })
 
     try:
@@ -2715,7 +2727,7 @@ def cmd_doctor(args, config) -> int:
         stored_lf = load_lastfm_session() or {}
         lastfm_ok = check("last.fm (signed in)", True, stored_lf.get("username", ""))
     else:
-        check("last.fm", False, "not connected — add lastfmApiKey and lastfmApiSecret to config, then run `lastfm-login`")
+        check("last.fm", False, "not connected — run `lastfm-login`")
         lastfm_ok = None
 
     report["ok"] = bool(signing_ok and reachable and listenbrainz_ok is not False and lastfm_ok is not False)
