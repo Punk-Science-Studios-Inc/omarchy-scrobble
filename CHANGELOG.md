@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.5.0
+
+A calmer card, and album art from the tags.
+
+- Split the bar card into **Now playing** and **Settings** tabs, one service
+  per block with stacked buttons, so nothing overruns the card
+- Round the avatar with a real mask, and wash the album cover faintly across
+  the whole card as a translucent backdrop, masked to the card's corners
+- Never fall back to the nip05 identifier on the card: it looks like an email
+  address and the card is on screen in public
+- Pin every dynamic `Text` element to `Text.PlainText`, so crafted track
+  metadata can only display literally, never as rich text (marketplace review
+  finding, submission #7546)
+- Extract embedded cover art from the local track file (ID3v2.2/2.3/2.4, FLAC,
+  MP4) when the player ships no `mpris:artUrl`: local files only, bounded
+  reads, cached atomically next to the avatar
+- Refresh the marketplace preview for the new card
+
 ## 1.4.0
 
 Ship Last.fm app credentials with the plugin, so users never register anything.
