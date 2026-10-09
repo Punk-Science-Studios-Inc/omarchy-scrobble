@@ -241,6 +241,7 @@ BarWidget {
           width: parent.width
           visible: root.lbLoginUrl !== "" && !root.lbLoginOpened
           text: root.lbLoginUrl
+          textFormat: Text.PlainText
           color: Qt.darker(root.bar.foreground, 1.2)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption
@@ -302,6 +303,7 @@ BarWidget {
           width: parent.width
           visible: root.lfLoginUrl !== "" && !root.lfLoginOpened
           text: root.lfLoginUrl
+          textFormat: Text.PlainText
           color: Qt.darker(root.bar.foreground, 1.2)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption
@@ -406,6 +408,7 @@ BarWidget {
           width: parent.width
           visible: root.loginUri !== "" && !root.loginQrAvailable
           text: root.loginUri
+          textFormat: Text.PlainText
           color: Qt.darker(root.bar.foreground, 1.3)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption
@@ -477,6 +480,7 @@ BarWidget {
           Text {
             width: parent.width
             text: root.identityText
+            textFormat: Text.PlainText
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.title
@@ -487,6 +491,7 @@ BarWidget {
           Text {
             width: parent.width
             text: root.npub !== "" ? Model.shortNpub(root.npub) : "No Nostr identity configured"
+            textFormat: Text.PlainText
             color: Qt.darker(root.bar.foreground, 1.5)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -497,6 +502,7 @@ BarWidget {
             width: parent.width
             visible: root.profile !== null && String(root.profile.nip05 || "") !== ""
             text: root.profile ? String(root.profile.nip05 || "") : ""
+            textFormat: Text.PlainText
             color: Qt.darker(root.bar.foreground, 1.6)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -542,7 +548,10 @@ BarWidget {
 
           Text {
             width: parent.width
+            // Plain text, always: track metadata comes from the player and
+            // must display literally, never as rich text.
             text: root.title !== "" ? root.title : root.trackLine
+            textFormat: Text.PlainText
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.subtitle
@@ -554,6 +563,7 @@ BarWidget {
             width: parent.width
             visible: root.artist !== ""
             text: root.artist
+            textFormat: Text.PlainText
             color: Qt.darker(root.bar.foreground, 1.3)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
@@ -564,6 +574,7 @@ BarWidget {
             width: parent.width
             visible: root.album !== "" || root.durationText !== ""
             text: [root.album, root.durationText].filter(function(part) { return part !== "" }).join("  ·  ")
+            textFormat: Text.PlainText
             color: Qt.darker(root.bar.foreground, 1.6)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -604,6 +615,7 @@ BarWidget {
         Text {
           width: parent.width - Style.space(13)
           text: root.statusText
+          textFormat: Text.PlainText
           color: Qt.darker(root.bar.foreground, 1.2)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -615,6 +627,7 @@ BarWidget {
         width: parent.width
         visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.playerName !== ""
         text: "Source: " + root.playerName
+        textFormat: Text.PlainText
         color: Qt.darker(root.bar.foreground, 1.7)
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
@@ -627,6 +640,7 @@ BarWidget {
         text: root.listenbrainzConnected
           ? ("ListenBrainz: " + (root.listenbrainzUser !== "" ? root.listenbrainzUser : "connected"))
           : "ListenBrainz: not connected"
+          textFormat: Text.PlainText
         color: Qt.darker(root.bar.foreground, root.listenbrainzConnected ? 1.4 : 1.7)
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
@@ -639,6 +653,7 @@ BarWidget {
         text: root.lastfmConnected
           ? ("Last.fm: " + (root.lastfmUser !== "" ? root.lastfmUser : "connected"))
           : "Last.fm: not connected"
+          textFormat: Text.PlainText
         color: Qt.darker(root.bar.foreground, root.lastfmConnected ? 1.4 : 1.7)
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
@@ -649,6 +664,7 @@ BarWidget {
         width: parent.width
         visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.lbLoginError !== ""
         text: root.lbLoginError
+        textFormat: Text.PlainText
         color: root.bar.urgent
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
@@ -659,6 +675,7 @@ BarWidget {
         width: parent.width
         visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.lfLoginError !== ""
         text: root.lfLoginError
+        textFormat: Text.PlainText
         color: root.bar.urgent
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
@@ -669,6 +686,7 @@ BarWidget {
         width: parent.width
         visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.loginError !== ""
         text: root.loginError
+        textFormat: Text.PlainText
         color: root.bar.urgent
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
