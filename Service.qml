@@ -85,7 +85,15 @@ Item {
     : ""
   readonly property string title: activePlayer ? Model.cleanField(activePlayer.trackTitle) : ""
   readonly property string album: activePlayer ? Model.cleanField(activePlayer.trackAlbum) : ""
-  readonly property string artUrl: activePlayer ? Model.cleanField(activePlayer.trackArtUrl) : ""
+  readonly property string mprisArtUrl: activePlayer ? Model.cleanField(activePlayer.trackArtUrl) : ""
+  // Where the playing file lives, from the raw MPRIS metadata. Players built
+  // on mpv ship no mpris:artUrl even when the file has embedded art, so the
+  // helper digs it out of the tags as a fallback.
+  readonly property string trackFileUrl: activePlayer && activePlayer.metadata
+    ? Model.cleanField(String(activePlayer.metadata["xesam:url"] || ""))
+    : ""
+  property string extractedArtUrl: ""
+  readonly property string artUrl: mprisArtUrl !== "" ? mprisArtUrl : extractedArtUrl
   readonly property string playerName: activePlayer
     ? Model.cleanField(activePlayer.identity || activePlayer.desktopEntry)
     : ""
@@ -433,6 +441,17 @@ Item {
 
   // ------------------------------------------------------------- reactions
 
+  // Album art straight from the tags when the player ships none over MPRIS.
+  // A player-provided url always wins; extraction is only a fallback, and a
+  // track with no local file (a stream, say) simply has no art.
+  function refreshArt() {
+    extractedArtUrl = ""
+    if (mprisArtUrl !== "" || trackFileUrl === "" || artProcess.running) return
+    artProcess.pendingUrl = trackFileUrl
+    artProcess.command = helperCommand(["extract-art", trackFileUrl])
+    artProcess.running = true
+  }
+
   // A track change restarts the settle timer rather than publishing straight
   // away: skipping through an album should cost one publish, not ten.
   onSignatureChanged: {
@@ -440,6 +459,7 @@ Item {
     publishedNostr = false
     publishedListenBrainz = false
     publishedLastFm = false
+    refreshArt()
     if (signature === "" || signature !== publishedSignature) {
       publishedSignature = ""
       listenedSignature = ""
@@ -556,6 +576,26 @@ Item {
     running: false
     command: []
     stdout: StdioCollector { waitForEnd: true }
+  }
+
+  Process {
+    id: artProcess
+    property string pendingUrl: ""
+    running: false
+    command: []
+    stdout: StdioCollector { id: artOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (root.mprisArtUrl !== "" || root.trackFileUrl !== pendingUrl) {
+        // The track moved on while it was being read: drop the result and
+        // have a look at whatever is playing now.
+        root.refreshArt()
+        return
+      }
+      var result = root.parseResult(artOut.text)
+      if (exitCode !== 0 || !result || !result.ok) return
+      var path = String(result.artPath || "")
+      root.extractedArtUrl = path !== "" ? "file://" + path : ""
+    }
   }
 
   Process {

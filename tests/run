@@ -15,6 +15,10 @@ echo "== helper crypto (python) =="
 python3 tests/helper_test.py
 
 echo
+echo "== embedded art extraction (python) =="
+python3 tests/art_test.py
+
+echo
 echo "== relay client (python) =="
 python3 tests/relay_test.py
 

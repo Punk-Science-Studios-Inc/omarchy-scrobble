@@ -2227,6 +2227,291 @@ def await_pairing(client_secret: bytes, relays: list, secret: str, timeout: floa
     return found or None
 
 
+# ---------------------------------------------------------------- track art
+#
+# Players built on mpv ship no mpris:artUrl even when the file on disk has
+# embedded cover art. The extract-art command reads the local file the player
+# says it is playing and pulls the first embedded picture out of its tags
+# into the cache. Only local files are ever read: file:// URLs and absolute
+# paths are accepted, everything else — streaming URLs especially — is
+# refused before anything is opened. The picture is not a secret, so a
+# plain read of the user's own media is fine here; the bounds keep the
+# helper from being talked into holding a huge buffer.
+
+MAX_TAG_BYTES = 16 * 1024 * 1024  # window scanned for embedded tags
+MAX_ART_BYTES = 4 * 1024 * 1024  # same ceiling as downloaded avatars
+
+ART_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def art_extension(mime: str, picture: bytes) -> str:
+    if picture.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if picture.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    cleaned = (mime or "").lower().split(";")[0].strip()
+    return ART_MIME_EXTENSIONS.get(cleaned, ".img")
+
+
+def resolve_track_file(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("", "file"):
+        raise ValueError(f"refusing non-file art source: {parts.scheme}")
+    if parts.netloc not in ("", "localhost"):
+        raise ValueError("refusing remote art source")
+    path = urllib.parse.unquote(parts.path)
+    if path == "" or not os.path.isabs(path):
+        raise ValueError("art source must be an absolute path")
+    return path
+
+
+def _deunsynchronise(blob: bytes) -> bytes:
+    return blob.replace(b"\xff\x00", b"\xff")
+
+
+def _syncsafe(blob: bytes) -> int:
+    return ((blob[0] & 0x7F) << 21) | ((blob[1] & 0x7F) << 14) | ((blob[2] & 0x7F) << 7) | (blob[3] & 0x7F)
+
+
+def _parse_apic(major: int, body: bytes):
+    if len(body) < 4:
+        return None
+    encoding = body[0]
+    cursor = 1
+    if major == 2:
+        fmt = body[1:4].decode("latin-1", "replace").upper()
+        mime = "image/png" if fmt == "PNG" else ("image/jpeg" if fmt in ("JPG", "JPEG") else fmt)
+        cursor = 4
+    else:
+        terminator = body.find(b"\x00", cursor)
+        if terminator < 0:
+            return None
+        mime = body[cursor:terminator].decode("latin-1", "replace")
+        cursor = terminator + 1
+    cursor += 1  # picture type
+    if encoding in (1, 2):  # UTF-16 description, terminated by a null pair
+        while cursor + 1 < len(body) and body[cursor:cursor + 2] != b"\x00\x00":
+            cursor += 2
+        cursor += 2
+    else:
+        terminator = body.find(b"\x00", cursor)
+        if terminator < 0:
+            return None
+        cursor = terminator + 1
+    picture = body[cursor:]
+    if not picture or len(picture) > MAX_ART_BYTES:
+        return None
+    return mime, picture
+
+
+def extract_id3_art(head: bytes):
+    """The first APIC frame of an ID3v2 tag, as (mime, picture)."""
+    if len(head) < 10 or head[:3] != b"ID3":
+        return None
+    major = head[3]
+    if major not in (2, 3, 4):
+        return None
+    flags = head[5]
+    size = _syncsafe(head[6:10])
+    if size > MAX_TAG_BYTES:
+        return None
+    tag = head[10:10 + size]
+    if flags & 0x80 and major < 4:
+        tag = _deunsynchronise(tag)
+    offset = 0
+    if flags & 0x40 and len(tag) >= 4:
+        # The extended header is skipped, whatever shape its size field has.
+        offset = _syncsafe(tag[:4]) if major == 4 else int.from_bytes(tag[:4], "big") + 4
+        offset = min(offset, len(tag))
+    frame_id_size, frame_size_size, frame_header = (3, 3, 6) if major == 2 else (4, 4, 10)
+    while offset + frame_header <= len(tag):
+        frame_id = tag[offset:offset + frame_id_size]
+        if frame_id[0:1] == b"\x00":
+            break  # padding marks the end of the frames
+        if major == 2:
+            body_size = int.from_bytes(tag[offset + 3:offset + 6], "big")
+        elif major == 3:
+            body_size = int.from_bytes(tag[offset + 4:offset + 8], "big")
+        else:
+            body_size = _syncsafe(tag[offset + 4:offset + 8])
+        if body_size <= 0 or offset + frame_header + body_size > len(tag):
+            break
+        body = tag[offset + frame_header:offset + frame_header + body_size]
+        if frame_id in (b"APIC", b"PIC"):
+            if major == 4 and (int.from_bytes(tag[offset + 9:offset + 10], "big") & 0x02):
+                body = _deunsynchronise(body)  # frame-level unsynchronisation
+            picture = _parse_apic(major, body)
+            if picture is not None:
+                return picture
+        offset += frame_header + body_size
+    return None
+
+
+def _parse_flac_picture(block: bytes):
+    if len(block) < 32:
+        return None
+    cursor = 4  # picture type
+    mime_length = int.from_bytes(block[cursor:cursor + 4], "big")
+    cursor += 4
+    if mime_length > 64 or cursor + mime_length > len(block):
+        return None
+    mime = block[cursor:cursor + mime_length].decode("latin-1", "replace")
+    cursor += mime_length
+    description_length = int.from_bytes(block[cursor:cursor + 4], "big")
+    cursor += 4
+    if description_length > 4096 or cursor + description_length > len(block):
+        return None
+    cursor += description_length + 16  # width, height, depth, colours
+    if cursor + 4 > len(block):
+        return None
+    data_length = int.from_bytes(block[cursor:cursor + 4], "big")
+    cursor += 4
+    picture = block[cursor:cursor + data_length]
+    if not picture or len(picture) != data_length or len(picture) > MAX_ART_BYTES:
+        return None
+    return mime, picture
+
+
+def extract_flac_art(head: bytes):
+    if head[:4] != b"fLaC":
+        return None
+    offset = 4
+    while offset + 4 <= len(head):
+        block_type = head[offset] & 0x7F
+        last = head[offset] & 0x80
+        length = int.from_bytes(head[offset + 1:offset + 4], "big")
+        if block_type == 6:  # PICTURE
+            picture = _parse_flac_picture(head[offset + 4:offset + 4 + length])
+            if picture is not None:
+                return picture
+        if last:
+            break
+        offset += 4 + length
+    return None
+
+
+def _mp4_atoms(blob: bytes):
+    offset = 0
+    while offset + 8 <= len(blob):
+        size = int.from_bytes(blob[offset:offset + 4], "big")
+        kind = blob[offset + 4:offset + 8]
+        header = 8
+        if size == 1:  # 64-bit size follows the type
+            if offset + 16 > len(blob):
+                return
+            size = int.from_bytes(blob[offset + 8:offset + 16], "big")
+            header = 16
+        if size < header or offset + size > len(blob):
+            return
+        yield kind, offset + header, size - header
+        offset += size
+
+
+def _mp4_find_moov(handle, file_size: int) -> bytes | None:
+    """Walk the top-level atoms, where the moov may sit at either end."""
+    handle.seek(0)
+    offset = 0
+    while offset + 8 <= file_size:
+        header = handle.read(16)
+        if len(header) < 8:
+            return None
+        size = int.from_bytes(header[:4], "big")
+        kind = header[4:8]
+        atom_header = 8
+        if size == 1:
+            if len(header) < 16:
+                return None
+            size = int.from_bytes(header[8:16], "big")
+            atom_header = 16
+        elif size == 0:
+            size = file_size - offset
+        if size < atom_header:
+            return None
+        if kind == b"moov":
+            if size - atom_header > MAX_TAG_BYTES:
+                return None
+            handle.seek(offset + atom_header)
+            blob = handle.read(size - atom_header)
+            return blob if len(blob) == size - atom_header else None
+        offset += size
+        handle.seek(offset)
+    return None
+
+
+def _extract_mp4_art(moov: bytes):
+    for kind, moov_start, moov_length in _mp4_atoms(moov):
+        if kind != b"udta":
+            continue
+        udta = moov[moov_start:moov_start + moov_length]
+        for kind2, udta_start, udta_length in _mp4_atoms(udta):
+            if kind2 != b"meta":
+                continue
+            # meta carries a version/flags quad before its children.
+            meta = udta[udta_start + 4:udta_start + udta_length]
+            for kind3, meta_start, meta_length in _mp4_atoms(meta):
+                if kind3 != b"ilst":
+                    continue
+                ilst = meta[meta_start:meta_start + meta_length]
+                for kind4, ilst_start, ilst_length in _mp4_atoms(ilst):
+                    if kind4 != b"covr":
+                        continue
+                    covr = ilst[ilst_start:ilst_start + ilst_length]
+                    for kind5, covr_start, covr_length in _mp4_atoms(covr):
+                        if kind5 != b"data" or covr_length < 8:
+                            continue
+                        indicator = int.from_bytes(covr[covr_start:covr_start + 4], "big")
+                        picture = covr[covr_start + 8:covr_start + covr_length]
+                        if not picture or len(picture) > MAX_ART_BYTES:
+                            continue
+                        mime = {13: "image/png", 14: "image/jpeg"}.get(indicator & 0xFFFFFF, "")
+                        return mime, picture
+    return None
+
+
+def extract_art(url: str) -> str:
+    """Path of the cached art for this track file, or "" when there is none."""
+    path = resolve_track_file(url)
+    try:
+        stat = os.stat(path)
+        with open(path, "rb") as handle:
+            head = handle.read(MAX_TAG_BYTES)
+            found = extract_id3_art(head) or extract_flac_art(head)
+            if found is None and head[4:8] == b"ftyp":
+                moov = _mp4_find_moov(handle, stat.st_size)
+                if moov is not None:
+                    found = _extract_mp4_art(moov)
+    except OSError as error:
+        raise ValueError(f"cannot read the track file: {error}") from error
+    if found is None:
+        return ""
+    mime, picture = found
+    os.makedirs(cache_dir(), exist_ok=True)
+    digest = hashlib.sha256(f"{path}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()[:16]
+    target = os.path.join(cache_dir(), f"art-{digest}{art_extension(mime, picture)}")
+    if os.path.exists(target):
+        return target  # same file, same art, already cached
+    descriptor, temporary = tempfile.mkstemp(prefix=".art-", dir=cache_dir())
+    try:
+        with os.fdopen(descriptor, "wb") as staged:
+            staged.write(picture)
+            staged.flush()
+            os.fsync(staged.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return target
+
+
 # ---------------------------------------------------------------------- cli
 
 
@@ -2629,6 +2914,15 @@ def cmd_lastfm_logout(args, config) -> int:
     return emit({"ok": delete_lastfm_session(), "mode": lastfm_mode(config)})
 
 
+def cmd_extract_art(args, config) -> int:
+    """Embedded cover art from the local track file, written to the cache."""
+    try:
+        art_path = extract_art(args.url)
+    except ValueError as error:
+        return emit({"ok": False, "error": str(error)})
+    return emit({"ok": True, "artPath": art_path})
+
+
 def cmd_state(args, config) -> int:
     """Everything the interface needs to render, with no network calls."""
     mode = signing_mode(config)
@@ -2821,6 +3115,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     state = subparsers.add_parser("state", help="print signing, ListenBrainz and Last.fm status, offline")
     state.set_defaults(handler=cmd_state)
+
+    extract = subparsers.add_parser(
+        "extract-art", help="pull embedded cover art from the local track file into the cache"
+    )
+    extract.add_argument("url", help="the track's xesam:url, or an absolute path")
+    extract.set_defaults(handler=cmd_extract_art)
 
     doctor = subparsers.add_parser("doctor", help="check config, relays and tokens")
     doctor.set_defaults(handler=cmd_doctor)
