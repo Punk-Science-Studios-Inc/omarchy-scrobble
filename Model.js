@@ -108,8 +108,8 @@ function identityLabel(profile) {
   if (display !== "") return display
   var name = cleanField(profile.name)
   if (name !== "") return name
-  var nip05 = cleanField(profile.nip05)
-  if (nip05 !== "") return nip05
+  // Never falls back to nip05: it looks like an email address and the card
+  // is on screen in public.
   return shortNpub(profile.npub)
 }
 

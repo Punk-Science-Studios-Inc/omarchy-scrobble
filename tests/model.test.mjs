@@ -96,7 +96,7 @@ assert.equal(context.shortNpub(""), "")
 assert.equal(context.identityLabel(null), "Not signed in")
 assert.equal(context.identityLabel({ displayName: "Darryl", name: "dgw", npub: NPUB }), "Darryl")
 assert.equal(context.identityLabel({ displayName: "", name: "dgw", npub: NPUB }), "dgw")
-assert.equal(context.identityLabel({ nip05: "dgw@punk.science", npub: NPUB }), "dgw@punk.science")
+assert.equal(context.identityLabel({ nip05: "dgw@punk.science", npub: NPUB }), context.shortNpub(NPUB))
 assert.equal(context.identityLabel({ npub: NPUB }), short)
 
 assert.equal(context.formatDuration(214000), "3:34")

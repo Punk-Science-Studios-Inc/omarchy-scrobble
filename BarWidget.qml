@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -78,11 +79,17 @@ BarWidget {
   // through a phone camera, not kept alive by holding the cursor still.
   readonly property bool pinned: loginActive || lbLoginActive || lfLoginActive
 
+  // A sign-in flow owns the whole card: the tabs step aside while it runs.
+  readonly property bool cardBusy: loginActive || lbLoginActive || lfLoginActive
+
+  property string activeTab: "now"
+
   readonly property bool opened: popupOpen
   function open() { closeDelay.stop(); popupOpen = true }
   function close() {
     closeDelay.stop()
     popupOpen = false
+    activeTab = "now"
     // Dismissing the card abandons a pairing in progress; leaving an unseen
     // one waiting on the relays would be worse than making you scan again.
     if (loginActive && service) service.cancelLogin()
@@ -202,6 +209,49 @@ BarWidget {
     triggerMode: "hover"
     contentWidth: popup.fittedContentWidth(Style.space(340))
     contentHeight: popup.fittedContentHeight(content.implicitHeight)
+
+    // The album cover, washed faintly across the whole card behind the
+    // content. Stretches out over the popup padding to the border and is
+    // masked to the card's rounded corners — plain clip only knows
+    // rectangles. Only once the image has actually loaded; no art, no wash.
+    Item {
+      anchors.fill: parent
+      anchors.margins: -popup.padding
+      visible: cardArt.status === Image.Ready
+      layer.enabled: true
+      layer.smooth: true
+      layer.effect: MultiEffect {
+        maskEnabled: true
+        maskSource: cardArtMask
+        maskThresholdMin: 0.5
+        maskSpreadAtMin: 0.02
+      }
+
+      Image {
+        id: cardArt
+        anchors.fill: parent
+        source: root.artUrl
+        fillMode: Image.PreserveAspectCrop
+        asynchronous: true
+        cache: true
+        smooth: true
+        opacity: 0.25
+      }
+
+      // The card surface shape, whose alpha crops the wash to its corners.
+      Item {
+        id: cardArtMask
+        anchors.fill: parent
+        visible: false
+        layer.enabled: true
+
+        Rectangle {
+          anchors.fill: parent
+          radius: Style.cornerRadius
+          color: "white"
+        }
+      }
+    }
 
     Column {
       id: content
@@ -433,334 +483,406 @@ BarWidget {
         }
       }
 
-      // -- identity
+      // -- tabs
 
-      Row {
+      ButtonGroup {
+        width: parent.width
+        visible: !root.cardBusy
+        options: [
+          { value: "now", label: "Now playing" },
+          { value: "settings", label: "Settings" }
+        ]
+        value: root.activeTab
+        foreground: root.bar.foreground
+        accent: Color.accent
+        fontFamily: root.bar.fontFamily
+        fontSize: Style.font.bodySmall
+        focusable: false
+        onChanged: function(selected) { root.activeTab = selected }
+      }
+
+      // -- now playing
+
+      Column {
         width: parent.width
         spacing: Style.space(10)
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
+        visible: !root.cardBusy && root.activeTab === "now"
 
-        Rectangle {
-          id: avatarFrame
-          width: Style.space(44)
-          height: width
-          color: Qt.darker(root.bar.foreground, 6)
-          border.width: 1
-          border.color: Qt.darker(root.bar.foreground, 2.4)
-          clip: true
+        Row {
+          width: parent.width
+          spacing: Style.space(10)
 
-          Image {
-            anchors.fill: parent
-            anchors.margins: 1
-            source: root.avatarPath !== "" ? "file://" + root.avatarPath : ""
-            fillMode: Image.PreserveAspectCrop
-            asynchronous: true
-            cache: true
-            smooth: true
-            visible: status === Image.Ready
+          Rectangle {
+            id: avatarFrame
+            width: Style.space(44)
+            height: width
+            radius: width / 2
+            color: Qt.darker(root.bar.foreground, 6)
+            border.width: 1
+            border.color: Qt.darker(root.bar.foreground, 2.4)
+
+            // The photo is cut into the circle by an alpha mask: plain clip
+            // only knows rectangles, so the image would square off the frame.
+            Item {
+              anchors.fill: parent
+              anchors.margins: 1
+              visible: root.avatarPath !== ""
+              layer.enabled: true
+              layer.smooth: true
+              layer.effect: MultiEffect {
+                maskEnabled: true
+                maskSource: avatarMask
+                maskThresholdMin: 0.5
+                maskSpreadAtMin: 0.02
+              }
+
+              Image {
+                id: avatarImage
+                anchors.fill: parent
+                source: root.avatarPath !== "" ? "file://" + root.avatarPath : ""
+                fillMode: Image.PreserveAspectCrop
+                asynchronous: true
+                cache: true
+                smooth: true
+              }
+
+              // A filled circle whose alpha decides where the photo shows.
+              Item {
+                id: avatarMask
+                anchors.fill: parent
+                visible: false
+                layer.enabled: true
+
+                Rectangle {
+                  anchors.fill: parent
+                  radius: width / 2
+                  color: "white"
+                }
+              }
+            }
+
+            // Shown until an avatar exists — a missing picture should not leave
+            // a hole in the card.
+            Text {
+              anchors.centerIn: parent
+              visible: root.avatarPath === ""
+              text: root.glyph
+              color: Qt.darker(root.bar.foreground, 2)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.heading
+            }
           }
 
-          // Shown until an avatar exists — a missing picture should not leave
-          // a hole in the card.
-          Text {
-            anchors.centerIn: parent
-            visible: root.avatarPath === ""
-            text: root.glyph
-            color: Qt.darker(root.bar.foreground, 2)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.heading
-          }
-        }
+          Column {
+            width: parent.width - avatarFrame.width - parent.spacing
+            spacing: Style.space(2)
+            anchors.verticalCenter: parent.verticalCenter
 
-        Column {
-          width: parent.width - avatarFrame.width - parent.spacing
-          spacing: Style.space(2)
-          anchors.verticalCenter: parent.verticalCenter
+            Text {
+              width: parent.width
+              text: root.identityText
+              textFormat: Text.PlainText
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              elide: Text.ElideRight
+            }
 
-          Text {
-            width: parent.width
-            text: root.identityText
-            textFormat: Text.PlainText
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.title
-            font.bold: true
-            elide: Text.ElideRight
-          }
-
-          Text {
-            width: parent.width
-            text: root.npub !== "" ? Model.shortNpub(root.npub) : "No Nostr identity configured"
-            textFormat: Text.PlainText
-            color: Qt.darker(root.bar.foreground, 1.5)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
-
-          Text {
-            width: parent.width
-            visible: root.profile !== null && String(root.profile.nip05 || "") !== ""
-            text: root.profile ? String(root.profile.nip05 || "") : ""
-            textFormat: Text.PlainText
-            color: Qt.darker(root.bar.foreground, 1.6)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
-        }
-      }
-
-      PanelSeparator {
-        foreground: root.bar.foreground
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
-      }
-
-      // -- current track
-
-      Row {
-        width: parent.width
-        spacing: Style.space(10)
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.trackLine !== ""
-
-        Rectangle {
-          id: artFrame
-          width: Style.space(44)
-          height: width
-          visible: art.status === Image.Ready
-          color: "transparent"
-          clip: true
-
-          Image {
-            id: art
-            anchors.fill: parent
-            source: root.artUrl
-            fillMode: Image.PreserveAspectCrop
-            asynchronous: true
-            cache: true
-            smooth: true
+            Text {
+              width: parent.width
+              text: root.npub !== "" ? Model.shortNpub(root.npub) : "No Nostr identity configured"
+              textFormat: Text.PlainText
+              color: Qt.darker(root.bar.foreground, 1.5)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
           }
         }
 
-        Column {
-          width: parent.width - (artFrame.visible ? artFrame.width + parent.spacing : 0)
-          spacing: Style.space(2)
-
-          Text {
-            width: parent.width
-            // Plain text, always: track metadata comes from the player and
-            // must display literally, never as rich text.
-            text: root.title !== "" ? root.title : root.trackLine
-            textFormat: Text.PlainText
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.subtitle
-            font.bold: true
-            elide: Text.ElideRight
-          }
-
-          Text {
-            width: parent.width
-            visible: root.artist !== ""
-            text: root.artist
-            textFormat: Text.PlainText
-            color: Qt.darker(root.bar.foreground, 1.3)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.body
-            elide: Text.ElideRight
-          }
-
-          Text {
-            width: parent.width
-            visible: root.album !== "" || root.durationText !== ""
-            text: [root.album, root.durationText].filter(function(part) { return part !== "" }).join("  ·  ")
-            textFormat: Text.PlainText
-            color: Qt.darker(root.bar.foreground, 1.6)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
+        PanelSeparator {
+          foreground: root.bar.foreground
         }
-      }
 
-      Text {
-        width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.trackLine === ""
-        text: "Nothing playing"
-        color: Qt.darker(root.bar.foreground, 1.5)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.body
-      }
+        // -- current track
 
-      PanelSeparator {
-        foreground: root.bar.foreground
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
-      }
+        Row {
+          width: parent.width
+          spacing: Style.space(10)
+          visible: root.trackLine !== ""
 
-      // -- what the plugin is doing about it
+          Rectangle {
+            id: artFrame
+            width: Style.space(44)
+            height: width
+            visible: art.status === Image.Ready
+            color: "transparent"
+            clip: true
 
-      Row {
-        width: parent.width
-        spacing: Style.space(6)
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
+            Image {
+              id: art
+              anchors.fill: parent
+              source: root.artUrl
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+              cache: true
+              smooth: true
+            }
+          }
 
-        Rectangle {
-          width: Style.space(7)
-          height: width
-          radius: width / 2
-          anchors.verticalCenter: parent.verticalCenter
-          color: root.live ? Color.accent : Qt.darker(root.bar.foreground, 2)
+          Column {
+            width: parent.width - (artFrame.visible ? artFrame.width + parent.spacing : 0)
+            spacing: Style.space(2)
+
+            Text {
+              width: parent.width
+              // Plain text, always: track metadata comes from the player and
+              // must display literally, never as rich text.
+              text: root.title !== "" ? root.title : root.trackLine
+              textFormat: Text.PlainText
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              visible: root.artist !== ""
+              text: root.artist
+              textFormat: Text.PlainText
+              color: Qt.darker(root.bar.foreground, 1.3)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              visible: root.album !== "" || root.durationText !== ""
+              text: [root.album, root.durationText].filter(function(part) { return part !== "" }).join("  ·  ")
+              textFormat: Text.PlainText
+              color: Qt.darker(root.bar.foreground, 1.6)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
         }
 
         Text {
-          width: parent.width - Style.space(13)
-          text: root.statusText
-          textFormat: Text.PlainText
-          color: Qt.darker(root.bar.foreground, 1.2)
+          width: parent.width
+          visible: root.trackLine === ""
+          text: "Nothing playing"
+          color: Qt.darker(root.bar.foreground, 1.5)
           font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.bodySmall
+          font.pixelSize: Style.font.body
+        }
+
+        PanelSeparator {
+          foreground: root.bar.foreground
+        }
+
+        // -- what the plugin is doing about it
+
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Rectangle {
+            width: Style.space(7)
+            height: width
+            radius: width / 2
+            anchors.verticalCenter: parent.verticalCenter
+            color: root.live ? Color.accent : Qt.darker(root.bar.foreground, 2)
+          }
+
+          Text {
+            width: parent.width - Style.space(13)
+            text: root.statusText
+            textFormat: Text.PlainText
+            color: Qt.darker(root.bar.foreground, 1.2)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+        }
+
+        Text {
+          width: parent.width
+          visible: root.playerName !== ""
+          text: "Source: " + root.playerName
+          textFormat: Text.PlainText
+          color: Qt.darker(root.bar.foreground, 1.7)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        Text {
+          width: parent.width
+          visible: root.configured
+          text: "Click to " + (root.publishingEnabled ? "pause" : "resume") + " publishing · middle click refreshes your profile"
+          color: Qt.darker(root.bar.foreground, 1.8)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
           wrapMode: Text.WordWrap
         }
       }
 
-      Text {
-        width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.playerName !== ""
-        text: "Source: " + root.playerName
-        textFormat: Text.PlainText
-        color: Qt.darker(root.bar.foreground, 1.7)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-      }
+      // -- settings: one service per block, buttons stacked so nothing
+      // overruns the card.
 
-      Text {
+      Column {
         width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
-        text: root.listenbrainzConnected
-          ? ("ListenBrainz: " + (root.listenbrainzUser !== "" ? root.listenbrainzUser : "connected"))
-          : "ListenBrainz: not connected"
-          textFormat: Text.PlainText
-        color: Qt.darker(root.bar.foreground, root.listenbrainzConnected ? 1.4 : 1.7)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-      }
+        spacing: Style.space(12)
+        visible: !root.cardBusy && root.activeTab === "settings"
 
-      Text {
-        width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
-        text: root.lastfmConnected
-          ? ("Last.fm: " + (root.lastfmUser !== "" ? root.lastfmUser : "connected"))
-          : "Last.fm: not connected"
-          textFormat: Text.PlainText
-        color: Qt.darker(root.bar.foreground, root.lastfmConnected ? 1.4 : 1.7)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-      }
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
 
-      Text {
-        width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.lbLoginError !== ""
-        text: root.lbLoginError
-        textFormat: Text.PlainText
-        color: root.bar.urgent
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
-      }
+          Text {
+            width: parent.width
+            text: root.configured ? "Nostr: " + root.identityText : "Nostr: not signed in"
+            textFormat: Text.PlainText
+            color: Qt.darker(root.bar.foreground, root.configured ? 1.4 : 1.7)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
 
-      Text {
-        width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.lfLoginError !== ""
-        text: root.lfLoginError
-        textFormat: Text.PlainText
-        color: root.bar.urgent
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
-      }
+          Text {
+            width: parent.width
+            visible: root.loginError !== ""
+            text: root.loginError
+            textFormat: Text.PlainText
+            color: root.bar.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
 
-      Text {
-        width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.loginError !== ""
-        text: root.loginError
-        textFormat: Text.PlainText
-        color: root.bar.urgent
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
-      }
+          Button {
+            visible: !root.configured
+            text: "Sign in with your phone"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: if (root.service) root.service.startLogin()
+          }
 
-      Row {
-        width: parent.width
-        spacing: Style.space(6)
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive
-
-        Button {
-          visible: !root.configured
-          text: "Sign in with your phone"
-          foreground: root.bar.foreground
-          bordered: true
-          focusable: true
-          onClicked: if (root.service) root.service.startLogin()
+          Button {
+            visible: root.configured && root.remoteSigner
+            text: "Sign out"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: if (root.service) root.service.logout()
+          }
         }
 
-        Button {
-          visible: root.configured && root.remoteSigner
-          text: "Sign out"
+        PanelSeparator {
           foreground: root.bar.foreground
-          bordered: true
-          focusable: true
-          onClicked: if (root.service) root.service.logout()
         }
 
-        Button {
-          visible: !root.listenbrainzConnected
-          text: "Connect ListenBrainz"
-          foreground: root.bar.foreground
-          bordered: true
-          focusable: true
-          onClicked: if (root.service) root.service.startListenBrainzLogin()
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Text {
+            width: parent.width
+            text: root.listenbrainzConnected
+              ? ("ListenBrainz: " + (root.listenbrainzUser !== "" ? root.listenbrainzUser : "connected"))
+              : "ListenBrainz: not connected"
+              textFormat: Text.PlainText
+            color: Qt.darker(root.bar.foreground, root.listenbrainzConnected ? 1.4 : 1.7)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+
+          Text {
+            width: parent.width
+            visible: root.lbLoginError !== ""
+            text: root.lbLoginError
+            textFormat: Text.PlainText
+            color: root.bar.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            visible: !root.listenbrainzConnected
+            text: "Connect ListenBrainz"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: if (root.service) root.service.startListenBrainzLogin()
+          }
+
+          Button {
+            visible: root.listenbrainzMode === "session"
+            text: "Disconnect ListenBrainz"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: if (root.service) root.service.listenbrainzLogout()
+          }
         }
 
-        Button {
-          visible: root.listenbrainzMode === "session"
-          text: "Disconnect ListenBrainz"
+        PanelSeparator {
           foreground: root.bar.foreground
-          bordered: true
-          focusable: true
-          onClicked: if (root.service) root.service.listenbrainzLogout()
         }
 
-        Button {
-          visible: !root.lastfmConnected
-          text: "Connect Last.fm"
-          foreground: root.bar.foreground
-          bordered: true
-          focusable: true
-          onClicked: if (root.service) root.service.startLastFmLogin()
-        }
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
 
-        Button {
-          visible: root.lastfmMode === "session"
-          text: "Disconnect Last.fm"
-          foreground: root.bar.foreground
-          bordered: true
-          focusable: true
-          onClicked: if (root.service) root.service.lastfmLogout()
-        }
-      }
+          Text {
+            width: parent.width
+            text: root.lastfmConnected
+              ? ("Last.fm: " + (root.lastfmUser !== "" ? root.lastfmUser : "connected"))
+              : "Last.fm: not connected"
+              textFormat: Text.PlainText
+            color: Qt.darker(root.bar.foreground, root.lastfmConnected ? 1.4 : 1.7)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
 
-      Text {
-        width: parent.width
-        visible: !root.loginActive && !root.lbLoginActive && !root.lfLoginActive && root.configured
-        text: "Click to " + (root.publishingEnabled ? "pause" : "resume") + " publishing · middle click refreshes your profile"
-        color: Qt.darker(root.bar.foreground, 1.8)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
+          Text {
+            width: parent.width
+            visible: root.lfLoginError !== ""
+            text: root.lfLoginError
+            textFormat: Text.PlainText
+            color: root.bar.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            visible: !root.lastfmConnected
+            text: "Connect Last.fm"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: if (root.service) root.service.startLastFmLogin()
+          }
+
+          Button {
+            visible: root.lastfmMode === "session"
+            text: "Disconnect Last.fm"
+            foreground: root.bar.foreground
+            bordered: true
+            focusable: true
+            onClicked: if (root.service) root.service.lastfmLogout()
+          }
+        }
       }
     }
   }
