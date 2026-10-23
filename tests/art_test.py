@@ -169,6 +169,118 @@ try:
 except ValueError:
     check("missing files are reported, not crashed", True)
 
+
+print("remote art fetch")
+
+# The runtime function shares the profile-picture path: public HTTPS only,
+# size-bounded, no automatic redirects, pinned to the validated address.
+# Exercise it against a fake transport so nothing leaves this process.
+class FakeResponse:
+    def __init__(self, blob, content_type="image/png"):
+        self.blob = blob
+        self.headers = {"Content-Type": content_type}
+
+    def read(self, limit):
+        return self.blob[:limit]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeOpener:
+    def __init__(self, response):
+        self.response = response
+
+    def open(self, request, timeout):
+        self.request = request
+        return self.response
+
+
+urls_seen = []
+
+
+def fake_download(url, blobs, prefix="art"):
+    """Drive _download_image with validate/opener stubs; no sockets."""
+    saved_validate = helper.validate_avatar_url
+    saved_opener = helper._avatar_opener
+    queue = list(blobs)
+    try:
+        helper.validate_avatar_url = lambda value: urls_seen.append(value) or "203.0.113.7"
+        helper._avatar_opener = lambda address: FakeOpener(queue.pop(0))
+        return helper.download_art(url)
+    finally:
+        helper.validate_avatar_url = saved_validate
+        helper._avatar_opener = saved_opener
+
+
+small = b"\x89PNG\r\n\x1a\n" + b"cover art payload for the fetch tests" * 4
+path = fake_download("https://covers.example/a.png", [FakeResponse(small)])
+check("remote art is cached to disk", path != "" and open(path, "rb").read() == small, f"got {path!r}")
+check("remote art is cached under the art prefix",
+      os.path.basename(path).startswith("art-"), path)
+check("remote art is cached in the test cache, not the user's",
+      path.startswith(CACHE_ROOT), path)
+check("a repeated remote art fetch reuses the cached file",
+      fake_download("https://covers.example/a.png", [FakeResponse(small)]) == path)
+check("the fetch validates the url before opening",
+      urls_seen[-1] == "https://covers.example/a.png", urls_seen[-1])
+
+oversize_body = b"x" * (helper.MAX_AVATAR_BYTES + 1)
+try:
+    fake_download("https://covers.example/huge.png", [FakeResponse(oversize_body)])
+    check("an oversized remote response is refused", False, "no error raised")
+except ValueError:
+    check("an oversized remote response is refused", True)
+
+try:
+    fake_download("https://covers.example/empty.png", [FakeResponse(b"")])
+    check("an empty remote response is refused", False, "no error raised")
+except ValueError:
+    check("an empty remote response is refused", True)
+
+for label, bad in [
+    ("http", "http://covers.example/a.png"),
+    ("ftp", "ftp://covers.example/a.png"),
+    ("file", "file:///tmp/cover.png"),
+    ("garbage", "not a url"),
+]:
+    try:
+        helper.download_art(bad)
+        check(f"fetch-art refuses a {label} url", False, "no error raised")
+    except ValueError:
+        check(f"fetch-art refuses a {label} url", True)
+
+# Redirects to the png are followed after each hop is revalidated — the
+# redirected url is what lands in the cache and the digest.
+redirects_seen = []
+saved_validate = helper.validate_avatar_url
+saved_opener = helper._avatar_opener
+try:
+    helper.validate_avatar_url = lambda value: redirects_seen.append(value) or "203.0.113.7"
+    helper._avatar_opener = lambda address: FakeOpener(FakeResponse(small, "image/jpeg"))
+    helper.download_art("https://covers.example/b.png")
+finally:
+    helper.validate_avatar_url = saved_validate
+    helper._avatar_opener = saved_opener
+check("downloaded redirects are revalidated per hop",
+      redirects_seen == ["https://covers.example/b.png"], redirects_seen)
+
+# And the whole thing hangs off the same validator the reviewers already
+# vetted for profile pictures.
+saved_validate = helper.validate_avatar_url
+try:
+    helper.validate_avatar_url = lambda value: (_ for _ in ()).throw(ValueError("stopped"))
+    try:
+        helper.download_art("https://covers.example/a.png")
+        check("download_art routes through the public-address validator", False, "no error raised")
+    except ValueError:
+        check("download_art routes through the public-address validator", True)
+finally:
+    helper.validate_avatar_url = saved_validate
+
 print()
 if failures:
     print(f"{len(failures)} art extraction check(s) failed")

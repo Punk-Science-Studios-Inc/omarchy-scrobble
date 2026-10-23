@@ -261,9 +261,10 @@ profile. ListenBrainz shows the play at <https://listenbrainz.org/user/you/>.
 tests/run
 ```
 
-That runs five suites:
+That runs eight suites:
 
-- `tests/model.test.mjs` — the publish/scrobble rules, in Node
+- `tests/model.test.mjs` — the publish/scrobble rules and art-url
+  classification, in Node
 - `tests/helper_test.py` — Schnorr signing, bech32, and the NIP-44/NIP-04
   encryption, against the published BIP-340, NIP-19, NIP-44, RFC 8439,
   FIPS-197 and NIST SP 800-38A test vectors
@@ -272,6 +273,13 @@ That runs five suites:
   mock phone signer, over both encryption schemes
 - `tests/listenbrainz_test.py` — the ListenBrainz sign-in and the exact
   submission parameters, against a local stub server
+- `tests/art_test.py` — embedded cover-art extraction and the bounded remote
+  art fetch, against synthetic audio files and a stubbed transport
+- `tests/security_test.py` — the security review blockers: event
+  authentication, avatar/art url confinement and address pinning, exercised
+  directly with no real network
+- `tests/lastfm_test.py` — the Last.fm sign-in and submission shape, against a
+  local stub server
 
 Nothing in the suite touches a public relay or a real account.
 
@@ -316,8 +324,13 @@ bin/omarchy-scrobble doctor
   the relays you configure and to ListenBrainz. That is the whole point, but it
   is public: a NIP-38 status is readable by anyone.
 - **Reads** MPRIS on your session bus to see what is playing.
-- **Stores** the signer session, the ListenBrainz session, and a cached copy of
-  your Nostr profile picture, in the paths listed under [Remove it](#remove-it).
+- **Downloads** album art itself: an `https` `mpris:artUrl` is fetched by the
+  helper — public HTTPS only, 4 MiB cap, per-hop redirect checks, pinned to
+  the validated address — and cached under `~/.cache/omarchy-scrobble`; local
+  artwork loads directly from disk. No QML network fetch is involved.
+- **Stores** the signer session, the ListenBrainz session, a cached copy of
+  your Nostr profile picture, and the cached album art for the current track,
+  in the paths listed under [Remove it](#remove-it).
 - **Writes** its own entry in `~/.config/omarchy/shell.json` when you toggle
   publishing from the card — the standard mechanism every bar widget uses for
   its own settings, and only on a click. It does not touch anything else in
