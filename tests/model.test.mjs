@@ -36,6 +36,19 @@ assert.equal(context.textSetting(undefined, ""), "")
 
 // ------------------------------------------------------------------ tracks
 
+// Art url classification, which decides where cover art may be sourced
+// from: https urls only ever reach the helper's bounded downloader.
+assert.equal(context.isHttpUrl("https://covers.example/a.jpg"), true)
+assert.equal(context.isHttpUrl("HTTPS://covers.example/a.jpg"), true)
+assert.equal(context.isHttpUrl("https:/example.com"), false)
+assert.equal(context.isHttpUrl("http://covers.example/a.jpg"), false)
+assert.equal(context.isHttpUrl("file:///home/me/cover.jpg"), false)
+assert.equal(context.isHttpUrl("HTTP://covers.example/a.jpg"), false)
+assert.equal(context.isHttpUrl(""), false)
+assert.equal(context.isHttpUrl(null), false)
+assert.equal(context.isHttpUrl(undefined), false)
+assert.equal(context.isHttpUrl("  https://covers.example/a.jpg  "), true)
+
 // MPRIS hands over an artist as a string or a list depending on the player.
 assert.equal(context.artistText("Ella Fitzgerald"), "Ella Fitzgerald")
 assert.equal(context.artistText(["Ella Fitzgerald", "Louis Armstrong"]), "Ella Fitzgerald, Louis Armstrong")

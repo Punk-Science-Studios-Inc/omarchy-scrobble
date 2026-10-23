@@ -92,8 +92,13 @@ Item {
   readonly property string trackFileUrl: activePlayer && activePlayer.metadata
     ? Model.cleanField(String(activePlayer.metadata["xesam:url"] || ""))
     : ""
-  property string extractedArtUrl: ""
-  readonly property string artUrl: mprisArtUrl !== "" ? mprisArtUrl : extractedArtUrl
+  property string fetchedArtUrl: ""
+  // Local paths and file urls load straight off disk in an Image. An https
+  // art url never reaches an Image: the helper downloads it into the
+  // size-bounded cache and the card points at the cached file instead, so a
+  // hostile art server cannot make the shell buffer its response.
+  readonly property string localArtUrl: mprisArtUrl !== "" && !Model.isHttpUrl(mprisArtUrl) ? mprisArtUrl : ""
+  readonly property string artUrl: localArtUrl !== "" ? localArtUrl : fetchedArtUrl
   readonly property string playerName: activePlayer
     ? Model.cleanField(activePlayer.identity || activePlayer.desktopEntry)
     : ""
@@ -441,15 +446,29 @@ Item {
 
   // ------------------------------------------------------------- reactions
 
-  // Album art straight from the tags when the player ships none over MPRIS.
-  // A player-provided url always wins; extraction is only a fallback, and a
-  // track with no local file (a stream, say) simply has no art.
+  // Cover art, and how it is sourced:
+  //  - a local path or file url from the player loads directly off disk;
+  //  - an https url is downloaded by the helper into the size-bounded cache
+  //    (never by an Image element, whose byte flow Qt does not bound) and
+  //    the card points at the cached file instead;
+  //  - when the player ships no art url but names a local file, the
+  //    embedded tags are extracted as a fallback.
+  // A pending fetch keeps the last art so the card does not flicker on a
+  // track change, so results are matched against the track's signature.
   function refreshArt() {
-    extractedArtUrl = ""
-    if (mprisArtUrl !== "" || trackFileUrl === "" || artProcess.running) return
-    artProcess.pendingUrl = trackFileUrl
-    artProcess.command = helperCommand(["extract-art", trackFileUrl])
-    artProcess.running = true
+    fetchedArtUrl = ""
+    if (artProcess.running) return
+    if (Model.isHttpUrl(mprisArtUrl)) {
+      artProcess.pendingSignature = signature
+      artProcess.command = helperCommand(["fetch-art", mprisArtUrl])
+      artProcess.running = true
+    } else if (mprisArtUrl !== "") {
+      return  // a local art url loads directly; nothing to fetch
+    } else if (trackFileUrl !== "") {
+      artProcess.pendingSignature = signature
+      artProcess.command = helperCommand(["extract-art", trackFileUrl])
+      artProcess.running = true
+    }
   }
 
   // A track change restarts the settle timer rather than publishing straight
@@ -580,21 +599,26 @@ Item {
 
   Process {
     id: artProcess
-    property string pendingUrl: ""
+    property string pendingSignature: ""
     running: false
     command: []
     stdout: StdioCollector { id: artOut; waitForEnd: true }
     onExited: function(exitCode) {
-      if (root.mprisArtUrl !== "" || root.trackFileUrl !== pendingUrl) {
-        // The track moved on while it was being read: drop the result and
-        // have a look at whatever is playing now.
+      if (pendingSignature !== root.signature) {
+        // The track moved on while it was being worked on: drop the result
+        // and have a look at whatever is playing now.
         root.refreshArt()
         return
       }
       var result = root.parseResult(artOut.text)
-      if (exitCode !== 0 || !result || !result.ok) return
+      if (exitCode !== 0 || !result || !result.ok) {
+        // An art url whose scheme the helper refuses (http, say) is dropped
+        // without falling back to the embedded tags, which are not a
+        // substitute for the cover the player named.
+        return
+      }
       var path = String(result.artPath || "")
-      root.extractedArtUrl = path !== "" ? "file://" + path : ""
+      root.fetchedArtUrl = path !== "" ? "file://" + path : ""
     }
   }
 

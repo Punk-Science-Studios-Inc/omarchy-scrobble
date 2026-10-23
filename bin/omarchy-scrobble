@@ -1819,8 +1819,16 @@ def _avatar_opener(address: str):
     )
 
 
-def download_avatar(url: str) -> str:
-    """Cache the profile picture locally so QML can point an Image at a file."""
+def _download_image(url: str, *, prefix: str) -> str:
+    """Download a public HTTPS image to the cache, size-bounded.
+
+    Shares the profile-picture trust rules: public HTTPS only, no
+    credentials, default port, every resolved address globally routable, no
+    automatic redirects (each hop is revalidated), and a TCP connection
+    pinned to the already-checked address so a DNS change cannot reroute it.
+    Reads stop at ``MAX_AVATAR_BYTES`` regardless of any Content-Length, so
+    no endpoint can make the shell buffer unbounded bytes.
+    """
     current = url
     response = None
     for _ in range(MAX_AVATAR_REDIRECTS + 1):
@@ -1837,13 +1845,15 @@ def download_avatar(url: str) -> str:
                 raise
             current = urllib.parse.urljoin(current, location)
     else:
-        raise ValueError("too many avatar redirects")
+        raise ValueError("too many image redirects")
 
     with response:
         content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
         blob = response.read(MAX_AVATAR_BYTES + 1)
     if len(blob) > MAX_AVATAR_BYTES:
-        raise ValueError("avatar is larger than 4 MiB")
+        raise ValueError("image is larger than 4 MiB")
+    if not blob:
+        raise ValueError("image response is empty")
 
     extension = {
         "image/png": ".png",
@@ -1856,12 +1866,25 @@ def download_avatar(url: str) -> str:
 
     os.makedirs(cache_dir(), exist_ok=True)
     digest = hashlib.sha256(current.encode()).hexdigest()[:16]
-    path = os.path.join(cache_dir(), f"avatar-{digest}{extension}")
+    path = os.path.join(cache_dir(), f"{prefix}-{digest}{extension}")
     temporary = path + ".part"
     with open(temporary, "wb") as handle:
         handle.write(blob)
     os.replace(temporary, path)
     return path
+
+
+def download_avatar(url: str) -> str:
+    """Cache the profile picture locally so QML can point an Image at a file."""
+    return _download_image(url, prefix="avatar")
+
+
+def download_art(url: str) -> str:
+    """Cache remote player-provided cover art through the same bounds."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError("remote art must be https")
+    return _download_image(url, prefix="art")
 
 
 def newest_metadata_event(events: list):
@@ -2923,6 +2946,15 @@ def cmd_extract_art(args, config) -> int:
     return emit({"ok": True, "artPath": art_path})
 
 
+def cmd_fetch_art(args, config) -> int:
+    """Remote https cover art, downloaded through the bounded fetch path."""
+    try:
+        art_path = download_art(args.url)
+    except ValueError as error:
+        return emit({"ok": False, "error": str(error)})
+    return emit({"ok": True, "artPath": art_path})
+
+
 def cmd_state(args, config) -> int:
     """Everything the interface needs to render, with no network calls."""
     mode = signing_mode(config)
@@ -3121,6 +3153,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     extract.add_argument("url", help="the track's xesam:url, or an absolute path")
     extract.set_defaults(handler=cmd_extract_art)
+
+    fetch = subparsers.add_parser(
+        "fetch-art", help="download remote https cover art into the bounded cache"
+    )
+    fetch.add_argument("url", help="the mpris:artUrl to fetch")
+    fetch.set_defaults(handler=cmd_fetch_art)
 
     doctor = subparsers.add_parser("doctor", help="check config, relays and tokens")
     doctor.set_defaults(handler=cmd_doctor)

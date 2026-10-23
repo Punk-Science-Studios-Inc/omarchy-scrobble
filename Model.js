@@ -94,6 +94,13 @@ function shouldSubmitListen(durationMs, playedMs) {
   return Number(playedMs) >= threshold
 }
 
+// Remote art is fetched by the helper, never by an Image element, so its
+// byte flow is bounded; anything else is a local path or file url.
+function isHttpUrl(value) {
+  var text = cleanField(value)
+  return text.substring(0, 8).toLowerCase() === "https://"
+}
+
 // ------------------------------------------------------------------ display
 
 function shortNpub(npub) {

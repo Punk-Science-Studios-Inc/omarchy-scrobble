@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.1
+
+Cover art from the network no longer touches the QML image pipeline.
+
+- Route `https` MPRIS artwork through the helper's bounded download path
+  and point the card at the cached file, so a hostile cover server cannot
+  make the shell buffer an unbounded response (marketplace review finding,
+  submission #11818)
+- The download shares the profile-picture rules: public HTTPS only, 4 MiB
+  cap, no automatic redirects, every resolved address checked, and the
+  TCP connection pinned to the validated address
+- Local artwork paths still load directly from disk; embedded-tag extraction
+  remains the fallback when no art url is shipped
+
 ## 1.5.0
 
 A calmer card, and album art from the tags.
